@@ -92,8 +92,8 @@ def extract_analytics_from_webhook_bytes(content_text, content_bytes):
                 
                 logger.debug(f"Parsed JSON successfully, found {len(analytics)} analytics keys")
                 
-                # Extract background image from webhook bytes
-                background_image = extract_background_image_from_webhook_bytes(content_bytes)
+                # Extract image from webhook bytes (tries high-res, falls back to cropped)
+                background_image = extract_image_with_fallback(content_bytes)
                 
                 if len(analytics) > 2:  # More than just channel/event
                     return analytics, background_image
@@ -105,20 +105,21 @@ def extract_analytics_from_webhook_bytes(content_text, content_bytes):
         return None, None
 
 
-def extract_background_image_from_webhook_bytes(content_bytes):
+def extract_image_from_webhook_bytes(content_bytes, image_name):
     """
-    Extract faceBackgroundImage (high-res full scene) from webhook multipart data
+    Extract specified image from webhook multipart data
     Args:
         content_bytes: Raw webhook content as bytes
+        image_name: Name of the image field (e.g., 'humanBackgroundImage' or 'humanImage')
     Returns JPEG bytes if found, None otherwise
     """
     try:
-        # Find faceBackgroundImage section in bytes
-        marker_pattern = b'Content-Disposition: form-data; name="faceBackgroundImage"'
+        # Find image section in bytes
+        marker_pattern = f'Content-Disposition: form-data; name="{image_name}"'.encode()
         marker_idx = content_bytes.find(marker_pattern)
         
         if marker_idx == -1:
-            logger.debug("faceBackgroundImage section not found in webhook")
+            logger.debug(f"{image_name} section not found in webhook")
             return None
         
         # Find Content-Type: image/jpeg after the marker
@@ -145,15 +146,49 @@ def extract_background_image_from_webhook_bytes(content_bytes):
         
         # Verify it's actually JPEG by checking for JPEG markers
         if not jpeg_data.startswith(b'\xff\xd8'):  # JPEG SOI marker
-            logger.warning("Extracted data doesn't start with JPEG marker")
+            logger.warning(f"Extracted {image_name} doesn't start with JPEG marker")
             return None
         
-        logger.info(f"✅ Extracted background image from webhook: {len(jpeg_data)} bytes")
+        logger.info(f"✅ Extracted {image_name} from webhook: {len(jpeg_data)} bytes")
         return jpeg_data
         
     except Exception as e:
-        logger.error(f"Error extracting background image: {e}")
+        logger.error(f"Error extracting {image_name}: {e}")
         return None
+
+
+def extract_image_with_fallback(content_bytes):
+    """
+    Extract image from webhook with fallback logic
+    Priority: high-res full scene images first, then cropped images
+    Returns JPEG bytes if found, None otherwise
+    """
+    # Try high-res full scene images (both naming conventions)
+    jpeg_data = extract_image_from_webhook_bytes(content_bytes, 'humanBackgroundImage')
+    if jpeg_data:
+        logger.info("🎯 Using high-res full scene image (humanBackgroundImage)")
+        return jpeg_data
+    
+    jpeg_data = extract_image_from_webhook_bytes(content_bytes, 'faceBackgroundImage')
+    if jpeg_data:
+        logger.info("🎯 Using high-res full scene image (faceBackgroundImage)")
+        return jpeg_data
+    
+    # Fallback to cropped images
+    logger.warning("⚠️ High-res images not found, trying cropped images as fallback")
+    jpeg_data = extract_image_from_webhook_bytes(content_bytes, 'humanImage')
+    if jpeg_data:
+        logger.info("🎯 Using cropped person image (humanImage) as fallback")
+        return jpeg_data
+    
+    jpeg_data = extract_image_from_webhook_bytes(content_bytes, 'faceImage')
+    if jpeg_data:
+        logger.info("🎯 Using cropped face image (faceImage) as fallback")
+        return jpeg_data
+    
+    # No images found
+    logger.warning("❌ No images found in webhook")
+    return None
 
 
 def cleanup_old_webhooks():
@@ -244,7 +279,7 @@ def process_analytics(analytics):
         # Format: 2026-02-08T08:29:23+01:00
         try:
             dt = datetime.fromisoformat(timestamp.replace('+01:00', ''))
-            formatted_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+            formatted_time = dt.strftime('%d-%m-%Y kl %H:%M')
             update_openhab_item('Hikvision_Timestamp', formatted_time)
         except:
             update_openhab_item('Hikvision_Timestamp', timestamp)
