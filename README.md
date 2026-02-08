@@ -270,3 +270,8 @@ sudo chmod +x /etc/openhab/hikvision-analytics/webhook_processor.py
 ## Version History
 - **v2.0** (2026-02-08) - Webhook-based real-time processing
 - **v1.0** (2026-02-07) - File-based monitor (deprecated)
+
+## Author
+**Nanna Agesen**  
+📧 Nanna@Agesen.dk  
+🐙 GitHub: [@Prinsessen](https://github.com/Prinsessen)
