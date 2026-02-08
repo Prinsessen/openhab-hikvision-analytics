@@ -7,7 +7,7 @@ This service receives HTTP webhook notifications from Hikvision cameras with bod
 - ✅ Real-time webhook processing (no file polling)
 - ✅ Extracts 26+ analytics fields from Face and Human detection
 - ✅ Extracts high-resolution detection images from webhook
-- ✅ Updates 18 OpenHAB items automatically via REST API
+- ✅ Updates 21 OpenHAB items automatically via REST API
 - ✅ Auto-cleanup: keeps last 50 webhook files
 - ✅ Systemd service with auto-restart on boot
 - ✅ Health monitoring endpoints
@@ -28,7 +28,7 @@ Hikvision Camera → Webhook (POST) → Flask Server → Parse JSON → Update O
 3. **Flask Processing**: 
    - Extracts analytics from JSON (gender, age, clothing, accessories, etc.)
    - Extracts faceBackgroundImage (high-res scene capture)
-   - Updates 18 OpenHAB items via REST API
+   - Updates 21 OpenHAB items via REST API
    - Saves detection image to `/etc/openhab/html/hikvision_latest.jpg`
 4. **OpenHAB Display**: Sitemap shows real-time data + image via webview
 
@@ -217,6 +217,7 @@ The service updates these items (defined in `items/hikvision_detection.items`):
 - `Hikvision_HasMask` - Face mask detected (Switch ON/OFF)
 - `Hikvision_HasBag` - Bag/backpack detected (Switch ON/OFF)
 - `Hikvision_HasThings` - Carrying items (Switch ON/OFF)
+- `Hikvision_Ride` - On bicycle/vehicle (Switch ON/OFF)
 
 **Motion & Quality:**
 - `Hikvision_MotionDirection` - Direction (forward/backward/left/right)

@@ -266,12 +266,14 @@ def process_analytics(analytics):
     bag = analytics.get('human_bag', 'no')
     things = analytics.get('human_things', 'no')
     mask = analytics.get('human_mask') or analytics.get('face_mask', 'no')
+    ride = analytics.get('human_ride', 'no')
     
     update_openhab_item('Hikvision_HasHat', 'ON' if hat == 'yes' else 'OFF')
     update_openhab_item('Hikvision_HasGlasses', 'ON' if glasses == 'yes' else 'OFF')
     update_openhab_item('Hikvision_HasBag', 'ON' if bag == 'yes' else 'OFF')
     update_openhab_item('Hikvision_HasThings', 'ON' if things == 'yes' else 'OFF')
     update_openhab_item('Hikvision_HasMask', 'ON' if mask == 'yes' else 'OFF')
+    update_openhab_item('Hikvision_Ride', 'ON' if ride == 'yes' else 'OFF')
     
     # Person attributes
     gender = analytics.get('human_gender') or analytics.get('face_gender', 'unknown')
