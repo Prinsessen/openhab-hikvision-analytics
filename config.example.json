@@ -1,0 +1,40 @@
+{
+  "service_name": "Hikvision Webhook Analytics Processor",
+  "version": "2.0",
+  "description": "Processes Hikvision camera webhooks and updates OpenHAB items with body detection analytics",
+  
+  "webhook": {
+    "port": 5001,
+    "endpoint": "/webhook",
+    "log_webhooks": true
+  },
+  
+  "openhab": {
+    "url": "http://localhost:8080",
+    "rest_api": "/rest/items",
+    "timeout_seconds": 5
+  },
+  
+  "items": {
+    "timestamp": "Hikvision_Timestamp",
+    "jacket_color": "Hikvision_JacketColor",
+    "trousers_color": "Hikvision_TrousersColor",
+    "jacket_type": "Hikvision_JacketType",
+    "trousers_type": "Hikvision_TrousersType",
+    "has_hat": "Hikvision_HasHat",
+    "has_glasses": "Hikvision_HasGlasses",
+    "has_bag": "Hikvision_HasBag",
+    "has_things": "Hikvision_HasThings",
+    "has_mask": "Hikvision_HasMask",
+    "gender": "Hikvision_Gender",
+    "age_group": "Hikvision_AgeGroup",
+    "hair_style": "Hikvision_HairStyle",
+    "motion_direction": "Hikvision_MotionDirection"
+  },
+  
+  "camera": {
+    "ip": "YOUR_CAMERA_IP",
+    "model": "DS-2DF8425IX-AEL",
+    "notes": "Configure camera to send HTTP notification to http://YOUR_SERVER_IP:5001/webhook"
+  }
+}

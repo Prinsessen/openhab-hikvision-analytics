@@ -1,0 +1,25 @@
+[Unit]
+Description=Hikvision Webhook Analytics Processor
+After=network.target openhab.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=openhab
+Group=openhab
+WorkingDirectory=/etc/openhab/hikvision-analytics
+ExecStart=/etc/openhab/.venv/bin/python3 -u /etc/openhab/hikvision-analytics/webhook_processor.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

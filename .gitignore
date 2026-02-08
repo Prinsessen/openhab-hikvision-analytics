@@ -1,0 +1,34 @@
+# Webhook test files
+webhook_*.txt
+
+# Configuration with sensitive data
+config.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup folders
+backup_old/
+
+# Logs
+*.log
