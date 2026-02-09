@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hikvision Body Detection</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 10px;
+            background-color: #1a1a1a;
+            font-family: Arial, sans-serif;
+            color: #ffffff;
+            overflow: auto;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        
+        h1 {
+            margin: 0 0 5px 0;
+            font-size: 18px;
+            color: #4CAF50;
+        }
+        
+        .status {
+            font-size: 12px;
+            color: #aaa;
+        }
+        
+        .timestamp {
+            font-size: 14px;
+            color: #4CAF50;
+            font-weight: bold;
+            margin-top: 5px;
+        }
+        
+        .image-container {
+            position: relative;
+            width: 100%;
+            background-color: #2a2a2a;
+            border-radius: 4px;
+            padding: 10px;
+        }
+        
+        .detection-image {
+            width: 100%;
+            height: auto;
+            max-height: calc(100vh - 200px);
+            object-fit: contain;
+            border-radius: 4px;
+            display: block;
+        }
+        
+        .image-info {
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #333;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid #444;
+        }
+        
+        .info-row:last-child {
+            border-bottom: none;
+        }
+        
+        .label {
+            color: #aaa;
+            font-weight: bold;
+        }
+        
+        .value {
+            color: #4CAF50;
+            font-weight: bold;
+        }
+        
+        .no-detection {
+            text-align: center;
+            padding: 60px 20px;
+            color: #666;
+            font-size: 18px;
+        }
+        
+        .error {
+            color: #f44336;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🎥 Hikvision Body Detection</h1>
+        <div class="timestamp" id="detectionTimestamp">Waiting for detection...</div>
+        <div class="status">Camera: 10.0.11.101 | Auto-refresh: 3 seconds</div>
+    </div>
+    
+    <div class="image-container">
+        <img id="detectionImage" 
+             class="detection-image" 
+             src="hikvision_latest.jpg" 
+             alt="Latest Detection"
+             onerror="handleImageError()">
+        <div class="image-info">
+            <div class="info-row">
+                <span class="label">Last Update:</span>
+                <span class="value" id="lastUpdate">Loading...</span>
+            </div>
+            <div class="info-row">
+                <span class="label">Status:</span>
+                <span class="value" id="status">Monitoring...</span>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let imageLoaded = false;
+        let lastModified = null;
+        
+        function updateTimestamp() {
+            const now = new Date();
+            document.getElementById('lastUpdate').textContent = now.toLocaleTimeString();
+        }
+        
+        function formatDetectionTime(timeString) {
+            // timeString is already in HH:MM:SS format from Python
+            const now = new Date();
+            const day = String(now.getDate()).padStart(2, '0');
+            const month = String(now.getMonth() + 1).padStart(2, '0');
+            const year = now.getFullYear();
+            return `${day}-${month}-${year} ${timeString}`;
+        }
+        
+        function refreshImage() {
+            const img = document.getElementById('detectionImage');
+            const timestamp = new Date().getTime();
+            
+            // Check timestamp file for updates (faster than Last-Modified header)
+            fetch('hikvision_latest_time.txt?' + timestamp)
+                .then(response => {
+                    if (!response.ok) throw new Error('Timestamp file not found');
+                    return response.text();
+                })
+                .then(detectionTime => {
+                    detectionTime = detectionTime.trim();
+                    if (detectionTime !== '' && detectionTime !== lastModified) {
+                        lastModified = detectionTime;
+                        img.src = 'hikvision_latest.jpg?' + timestamp;
+                        updateTimestamp();
+                        document.getElementById('status').textContent = 'Detection Updated';
+                        document.getElementById('status').style.color = '#4CAF50';
+                        
+                        // Update detection timestamp with date
+                        const formattedTime = formatDetectionTime(detectionTime);
+                        document.getElementById('detectionTimestamp').textContent = formattedTime;
+                        
+                        imageLoaded = true;
+                    }
+                })
+                .catch(error => {
+                    console.log('Timestamp check failed:', error);
+                });
+        }
+        
+        function handleImageError() {
+            if (!imageLoaded) {
+                document.getElementById('detectionImage').style.display = 'none';
+                document.getElementById('status').innerHTML = '<span class="error">No detections yet - waiting for first event...</span>';
+            }
+        }
+        
+        // Initial load
+        updateTimestamp();
+        refreshImage();
+        
+        // Refresh image every 3 seconds
+        setInterval(refreshImage, 3000);
+        
+        // Update timestamp every second
+        setInterval(updateTimestamp, 1000);
+    </script>
+</body>
+</html>

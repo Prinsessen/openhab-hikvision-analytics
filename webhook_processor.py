@@ -11,25 +11,80 @@ from datetime import datetime
 import logging
 import os
 import glob
+import tempfile
+import xml.etree.ElementTree as ET
+from collections import deque
 
-# Configuration
-OPENHAB_URL = "http://localhost:8080"
-WEBHOOK_PORT = 5001
-LOG_WEBHOOKS = True  # Set to False to disable webhook logging
-WEBHOOK_DIR = "/etc/openhab/hikvision-analytics"
-MAX_WEBHOOK_FILES = 50  # Keep only the last 50 webhook files
-HTML_OUTPUT_PATH = "/etc/openhab/html"  # Where to save detection images
-IMAGE_FILENAME = "hikvision_latest.jpg"  # Output image filename
-TIMESTAMP_FILENAME = "hikvision_latest_time.txt"  # Output timestamp filename
+# Load configuration from JSON file
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.json')
+try:
+    with open(CONFIG_FILE, 'r') as f:
+        CONFIG = json.load(f)
+except FileNotFoundError:
+    print(f"❌ CRITICAL: Configuration file not found: {CONFIG_FILE}")
+    print(f"⚠️  Service will use hardcoded defaults - this may cause incorrect behavior!")
+    CONFIG = {}
+except json.JSONDecodeError as e:
+    print(f"❌ CRITICAL: Invalid JSON in configuration file: {e}")
+    print(f"⚠️  Service will use hardcoded defaults - this may cause incorrect behavior!")
+    CONFIG = {}
 
-# Setup logging
+# Configuration (with fallbacks if config.json missing)
+OPENHAB_URL = CONFIG.get('openhab', {}).get('url', "http://localhost:8080")
+OPENHAB_TIMEOUT = CONFIG.get('openhab', {}).get('timeout_seconds', 5)
+OPENHAB_HEALTH_TIMEOUT = CONFIG.get('openhab', {}).get('health_check_timeout', 2)
+WEBHOOK_PORT = CONFIG.get('webhook', {}).get('port', 5001)
+LOG_WEBHOOKS = CONFIG.get('webhook', {}).get('log_webhooks', True)
+MAX_WEBHOOK_FILES = CONFIG.get('webhook', {}).get('max_saved_files', 50)
+WEBHOOK_DIR = CONFIG.get('paths', {}).get('webhook_dir', "/etc/openhab/hikvision-analytics")
+HTML_OUTPUT_PATH = CONFIG.get('paths', {}).get('html_output', "/etc/openhab/html")
+IMAGE_FILENAME = CONFIG.get('files', {}).get('body_detection_image', "hikvision_latest.jpg")
+TIMESTAMP_FILENAME = CONFIG.get('files', {}).get('body_detection_timestamp', "hikvision_latest_time.txt")
+
+# Detection configuration
+MOVEMENT_THRESHOLD = CONFIG.get('detection', {}).get('movement_threshold', 0.015)
+POSITION_MARGIN = CONFIG.get('detection', {}).get('position_margin', 0.02)
+HISTORY_TIME_WINDOW = CONFIG.get('detection', {}).get('history_time_window_seconds', 120)
+HISTORY_BUFFER_SIZE = CONFIG.get('detection', {}).get('history_buffer_size', 5)
+CAMERA_RESOLUTION = CONFIG.get('detection', {}).get('camera_resolution', {'width': 1280, 'height': 720})
+
+# Camera configuration from JSON
+CAMERA_BODY = CONFIG.get('cameras', {}).get('body_detection', {})
+CAMERA_LINE = CONFIG.get('cameras', {}).get('line_crossing', {})
+
+# Setup logging (must be before validation)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+# Validate configuration values (after logger setup)
+if not (0 < MOVEMENT_THRESHOLD <= 1.0):
+    logger.warning(f"Invalid movement_threshold {MOVEMENT_THRESHOLD}, using default 0.015")
+    MOVEMENT_THRESHOLD = 0.015
+if not (0 < POSITION_MARGIN <= 1.0):
+    logger.warning(f"Invalid position_margin {POSITION_MARGIN}, using default 0.02")
+    POSITION_MARGIN = 0.02
+if HISTORY_TIME_WINDOW < 1:
+    logger.warning(f"Invalid history_time_window_seconds {HISTORY_TIME_WINDOW}, using default 120")
+    HISTORY_TIME_WINDOW = 120
+if HISTORY_BUFFER_SIZE < 1:
+    logger.warning(f"Invalid history_buffer_size {HISTORY_BUFFER_SIZE}, using default 5")
+    HISTORY_BUFFER_SIZE = 5
+
+# Validate CAMERA_RESOLUTION is a dict (must be after logger setup)
+if not isinstance(CAMERA_RESOLUTION, dict):
+    logger.warning(f"Invalid camera_resolution type (expected dict, got {type(CAMERA_RESOLUTION).__name__}), using defaults")
+    CAMERA_RESOLUTION = {'width': 1280, 'height': 720}
+CAMERA_WIDTH = CAMERA_RESOLUTION.get('width', 1280)
+CAMERA_HEIGHT = CAMERA_RESOLUTION.get('height', 720)
+
 app = Flask(__name__)
+
+# Detection history for direction tracking (configurable buffer size)
+# Each entry: {'timestamp': datetime, 'x': float, 'y': float, 'target': str}
+detection_history = deque(maxlen=HISTORY_BUFFER_SIZE)
 
 
 def extract_analytics_from_webhook_bytes(content_text, content_bytes):
@@ -49,21 +104,51 @@ def extract_analytics_from_webhook_bytes(content_text, content_bytes):
             json_start = content_text.find('{\n        "ipAddress"')
         
         if json_start != -1:
-            # Find the end of this JSON object
-            brace_count = 0
-            json_end = -1
-            for i in range(json_start, len(content_text)):
-                if content_text[i] == '{':
-                    brace_count += 1
-                elif content_text[i] == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        json_end = i + 1
-                        break
-            
-            if json_end != -1:
+            # Find the end of this JSON object using json.JSONDecoder
+            # This is more robust than manual brace counting (handles escaped braces in strings)
+            try:
+                from json import JSONDecoder
+                decoder = JSONDecoder()
+                result, json_end_idx = decoder.raw_decode(content_text, json_start)
+                json_str = content_text[json_start:json_start + json_end_idx]
+            except (json.JSONDecodeError, ValueError) as json_err:
+                logger.warning(f"Failed to parse JSON with decoder: {json_err}")
+                # Fallback to manual brace counting (less robust but backward compatible)
+                brace_count = 0
+                json_end = -1
+                in_string = False
+                escape_next = False
+                for i in range(json_start, len(content_text)):
+                    char = content_text[i]
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if char == '\\':
+                        escape_next = True
+                        continue
+                    if char == '"' and not in_string:
+                        in_string = True
+                    elif char == '"' and in_string:
+                        in_string = False
+                    elif not in_string:
+                        if char == '{':
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                json_end = i + 1
+                                break
+                
+                if json_end == -1:
+                    logger.warning("Could not find end of JSON object")
+                    return None, None
+                
                 json_str = content_text[json_start:json_end]
-                result = json.loads(json_str)
+                try:
+                    result = json.loads(json_str)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse extracted JSON: {e}")
+                    return None, None
                 
                 analytics = {}
                 
@@ -145,8 +230,11 @@ def extract_image_from_webhook_bytes(content_bytes, image_name):
         jpeg_data = content_bytes[jpeg_start:boundary_end].strip()
         
         # Verify it's actually JPEG by checking for JPEG markers
-        if not jpeg_data.startswith(b'\xff\xd8'):  # JPEG SOI marker
-            logger.warning(f"Extracted {image_name} doesn't start with JPEG marker")
+        if not jpeg_data.startswith(b'\xff\xd8'):  # JPEG SOI (Start of Image) marker
+            logger.warning(f"Extracted {image_name} doesn't start with JPEG SOI marker")
+            return None
+        if not jpeg_data.endswith(b'\xff\xd9'):  # JPEG EOI (End of Image) marker
+            logger.warning(f"Extracted {image_name} doesn't end with JPEG EOI marker (incomplete image)")
             return None
         
         logger.info(f"✅ Extracted {image_name} from webhook: {len(jpeg_data)} bytes")
@@ -218,17 +306,21 @@ def save_detection_image(jpeg_data, timestamp_str):
         timestamp_str: Detection timestamp string (HH:MM:SS format)
     """
     try:
-        # Save image
+        # Save image atomically (temp file + rename)
         image_path = os.path.join(HTML_OUTPUT_PATH, IMAGE_FILENAME)
-        with open(image_path, 'wb') as f:
-            f.write(jpeg_data)
+        with tempfile.NamedTemporaryFile(mode='wb', dir=HTML_OUTPUT_PATH, delete=False) as tmp:
+            tmp.write(jpeg_data)
+            temp_path = tmp.name
+        os.rename(temp_path, image_path)
         logger.info(f"✅ Saved detection image: {image_path} ({len(jpeg_data)} bytes)")
         
-        # Save timestamp (just time part for HTML display)
+        # Save timestamp atomically (just time part for HTML display)
         time_only = timestamp_str.split()[1] if ' ' in timestamp_str else timestamp_str
         timestamp_path = os.path.join(HTML_OUTPUT_PATH, TIMESTAMP_FILENAME)
-        with open(timestamp_path, 'w') as f:
-            f.write(time_only)
+        with tempfile.NamedTemporaryFile(mode='w', dir=HTML_OUTPUT_PATH, delete=False) as tmp:
+            tmp.write(time_only)
+            temp_path = tmp.name
+        os.rename(temp_path, timestamp_path)
         logger.debug(f"Saved timestamp: {timestamp_path}")
         
     except Exception as e:
@@ -243,7 +335,7 @@ def update_openhab_item(item_name, value):
             "Content-Type": "text/plain",
             "Accept": "application/json"
         }
-        response = requests.put(url, data=str(value), headers=headers, timeout=5)
+        response = requests.put(url, data=str(value), headers=headers, timeout=OPENHAB_TIMEOUT)
         
         if response.status_code in [200, 201, 202]:
             logger.debug(f"✓ Updated {item_name} = {value}")
@@ -254,6 +346,405 @@ def update_openhab_item(item_name, value):
     except Exception as e:
         logger.error(f"Error updating {item_name}: {e}")
         return False
+
+
+def extract_linedetection_from_xml(content_text, content_bytes):
+    """
+    Extract line crossing detection data from XML webhook content (Camera 2)
+    Args:
+        content_text: Webhook content as text string (for XML parsing)
+        content_bytes: Webhook content as bytes (for image extraction)
+    Returns tuple: (linedetection_dict, jpeg_image_bytes)
+    """
+    try:
+        # Find XML section (starts after boundary)
+        xml_start = content_text.find('<?xml version')
+        if xml_start == -1:
+            logger.warning("No XML content found in webhook")
+            return None, None
+        
+        # Find end of XML (before next boundary or image data)
+        # Look for the closing </EventNotificationAlert> tag
+        xml_end = content_text.find('</EventNotificationAlert>', xml_start)
+        if xml_end == -1:
+            logger.warning("No closing XML tag </EventNotificationAlert> found")
+            return None, None
+        
+        # Include the closing tag in the extracted content
+        xml_end += len('</EventNotificationAlert>')
+        xml_content = content_text[xml_start:xml_end]
+        
+        # Remove namespace to simplify parsing (xmlns causes issues with findtext)
+        xml_content = xml_content.replace(' xmlns="http://www.hikvision.com/ver20/XMLSchema"', '')
+        
+        # Parse XML
+        root = ET.fromstring(xml_content)
+        
+        # Extract data
+        linedata = {}
+        
+        # Camera information
+        linedata['camera_ip'] = root.findtext('.//ipAddress', '')
+        linedata['camera_mac'] = root.findtext('.//macAddress', '')
+        linedata['channel_id'] = root.findtext('.//channelID', '0')
+        linedata['channel_name'] = root.findtext('.//channelName', '')
+        
+        # Event information
+        linedata['event_type'] = root.findtext('.//eventType', '')
+        linedata['event_state'] = root.findtext('.//eventState', '')
+        linedata['datetime'] = root.findtext('.//dateTime', '')
+        linedata['event_description'] = root.findtext('.//eventDescription', '')
+        
+        # Detection settings
+        linedata['region_id'] = root.findtext('.//regionID', '0')
+        linedata['sensitivity'] = root.findtext('.//sensitivityLevel', '0')
+        linedata['detection_target'] = root.findtext('.//detectionTarget', '')
+        
+        # Direction - try multiple possible field names
+        direction = root.findtext('.//direction', '') or \
+                   root.findtext('.//crossingDirection', '') or \
+                   root.findtext('.//Direction', '') or \
+                   root.findtext('.//CrossingDirection', '')
+        linedata['direction'] = direction
+        
+        # Interpret object type from detection target
+        target = linedata['detection_target'].lower()
+        if 'human' in target:
+            linedata['object_type'] = 'Human'
+        elif 'vehicle' in target or 'car' in target:
+            linedata['object_type'] = 'Vehicle'
+        elif target == 'others' or target == 'other':
+            linedata['object_type'] = 'Unknown Object'
+        else:
+            linedata['object_type'] = target.title() if target else 'Unknown'
+        
+        # Line coordinates - extract for calculating position relative to line
+        line_x1, line_x2, line_y1, line_y2 = None, None, None, None
+        coords_elem = root.find('.//RegionCoordinatesList')
+        if coords_elem is not None:
+            coords_list_x = coords_elem.findall('.//positionX')
+            coords_list_y = coords_elem.findall('.//positionY')
+            if len(coords_list_x) >= 2 and len(coords_list_y) >= 2:
+                try:
+                    line_x1 = float(coords_list_x[0].text) / float(CAMERA_WIDTH)  # Normalize to 0-1
+                    line_x2 = float(coords_list_x[1].text) / float(CAMERA_WIDTH)
+                    line_y1 = float(coords_list_y[0].text) / float(CAMERA_HEIGHT)  # Normalize to 0-1
+                    line_y2 = float(coords_list_y[1].text) / float(CAMERA_HEIGHT)
+                except (ValueError, TypeError, AttributeError) as e:
+                    logger.warning(f"Failed to parse line coordinates: {e}")
+                    pass
+            coords_text = ', '.join([f"({c.find('../positionX').text},{c.find('../positionY').text})" 
+                                    for c in coords_elem.findall('.//RegionCoordinates') 
+                                    if c.find('../positionX') is not None])
+            linedata['line_coordinates'] = coords_text if coords_text else ''
+        else:
+            linedata['line_coordinates'] = ''
+        
+        # Detect line orientation (vertical vs horizontal)
+        linedata['line_orientation'] = 'unknown'
+        if line_x1 is not None and line_y1 is not None and line_x2 is not None and line_y2 is not None:
+            x_diff = abs(line_x1 - line_x2)
+            y_diff = abs(line_y1 - line_y2)
+            if y_diff > x_diff * 2:  # Y difference is much larger = vertical line
+                linedata['line_orientation'] = 'vertical'
+                linedata['tracking_axis'] = 'X'
+            elif x_diff > y_diff * 2:  # X difference is much larger = horizontal line
+                linedata['line_orientation'] = 'horizontal'
+                linedata['tracking_axis'] = 'Y'
+            else:
+                # Diagonal line: track axis with larger movement
+                linedata['line_orientation'] = 'diagonal'
+                linedata['tracking_axis'] = 'Y' if y_diff > x_diff else 'X'
+        
+        # Target rectangle (normalized 0-1 coordinates)
+        target_rect = root.find('.//TargetRect')
+        if target_rect is not None:
+            linedata['target_x'] = target_rect.findtext('X', '0')
+            linedata['target_y'] = target_rect.findtext('Y', '0')
+            linedata['target_width'] = target_rect.findtext('width', '0')
+            linedata['target_height'] = target_rect.findtext('height', '0')
+        else:
+            linedata['target_x'] = '0'
+            linedata['target_y'] = '0'
+            linedata['target_width'] = '0'
+            linedata['target_height'] = '0'
+        
+        # Calculate side/direction if camera doesn't provide it
+        if not linedata['direction']:
+            try:
+                target_x = float(linedata['target_x'])
+                target_y = float(linedata['target_y'])
+                
+                if linedata['line_orientation'] == 'vertical' and line_x1 is not None:
+                    # Vertical line: compare X positions
+                    line_center = (line_x1 + line_x2) / 2 if line_x2 else line_x1
+                    if target_x < line_center - POSITION_MARGIN:
+                        linedata['calculated_side'] = 'Detected left side'
+                    elif target_x > line_center + POSITION_MARGIN:
+                        linedata['calculated_side'] = 'Detected right side'
+                    else:
+                        linedata['calculated_side'] = 'At detection line'
+                elif linedata['line_orientation'] == 'horizontal' and line_y1 is not None:
+                    # Horizontal line: compare Y positions
+                    line_center = (line_y1 + line_y2) / 2 if line_y2 else line_y1
+                    if target_y < line_center - POSITION_MARGIN:
+                        linedata['calculated_side'] = 'Detected above line'
+                    elif target_y > line_center + POSITION_MARGIN:
+                        linedata['calculated_side'] = 'Detected below line'
+                    else:
+                        linedata['calculated_side'] = 'At detection line'
+                else:
+                    linedata['calculated_side'] = 'Position unknown'
+            except (ValueError, TypeError) as e:
+                logger.debug(f"Error calculating line side: {e}")
+                linedata['calculated_side'] = ''
+        else:
+            linedata['calculated_side'] = ''
+        
+        # Extract JPEG image from multipart data
+        jpeg_data = None
+        try:
+            # Find JPEG start marker (0xFFD8) - standard JPEG SOI marker
+            jpeg_start_idx = content_bytes.find(b'\xff\xd8')
+            if jpeg_start_idx != -1:
+                # Find JPEG end marker (0xFFD9)
+                jpeg_end_idx = content_bytes.rfind(b'\xff\xd9')
+                if jpeg_end_idx != -1:
+                    jpeg_data = content_bytes[jpeg_start_idx:jpeg_end_idx + 2]
+                    logger.info(f"✅ Extracted line crossing image: {len(jpeg_data)} bytes")
+        except Exception as img_error:
+            logger.error(f"Error extracting line crossing image: {img_error}")
+        
+        logger.info(f"✅ Extracted line crossing data from camera {linedata.get('camera_ip')}")
+        return linedata, jpeg_data
+        
+    except Exception as e:
+        logger.error(f"Error parsing line crossing XML: {e}", exc_info=True)
+        return None, None
+
+
+def process_linedetection(linedata):
+    """
+    Process line crossing detection data and update OpenHAB items (Camera 2)
+    Args:
+        linedata: Dictionary containing line crossing detection data
+    """
+    if not linedata:
+        logger.warning("No line crossing data to process")
+        return
+    
+    logger.info("Processing line crossing detection data...")
+    
+    # Event information
+    update_openhab_item('LineCrossing_EventType', linedata.get('event_type', ''))
+    update_openhab_item('LineCrossing_EventState', linedata.get('event_state', ''))
+    update_openhab_item('LineCrossing_EventDescription', linedata.get('event_description', ''))
+    
+    # Update timestamp (convert to DateTime format)
+    datetime_str = linedata.get('datetime', '')
+    if datetime_str:
+        try:
+            # Parse ISO format: 2026-02-09T07:39:01+01:00
+            dt_obj = datetime.fromisoformat(datetime_str.replace('+01:00', '').replace('+00:00', '').replace('+02:00', ''))
+            # Format for OpenHAB DateTime item: ISO 8601
+            update_openhab_item('LineCrossing_DetectionTime', dt_obj.isoformat())
+        except Exception as e:
+            logger.warning(f"Could not parse datetime: {datetime_str}, error: {e}")
+    
+    # Camera information
+    update_openhab_item('LineCrossing_CameraIP', linedata.get('camera_ip', ''))
+    update_openhab_item('LineCrossing_CameraMAC', linedata.get('camera_mac', ''))
+    update_openhab_item('LineCrossing_ChannelID', linedata.get('channel_id', '0'))
+    update_openhab_item('LineCrossing_ChannelName', linedata.get('channel_name', ''))
+    
+    # Detection target and position
+    detection_target = linedata.get('detection_target', '')
+    object_type = linedata.get('object_type', 'Unknown')
+    update_openhab_item('LineCrossing_DetectionTarget', detection_target)
+    update_openhab_item('LineCrossing_ObjectType', object_type)
+    
+    # Calculate direction from position history
+    target_x = linedata.get('target_x', '')
+    target_y = linedata.get('target_y', '')
+    line_orientation = linedata.get('line_orientation', 'unknown')
+    tracking_axis = linedata.get('tracking_axis', 'X')
+    direction_text = 'Direction Not Available'
+    
+    logger.info(f"🔍 Starting direction calculation - Line:{line_orientation}, Axis:{tracking_axis}, X={target_x}, Y={target_y}, History:{len(detection_history)}")
+    
+    try:
+        current_x = float(target_x) if target_x else None
+        current_y = float(target_y) if target_y else None
+        current_time = datetime.now()
+        
+        # Determine which coordinate to track based on line orientation
+        if tracking_axis == 'X' and current_x is not None:
+            current_pos = current_x
+            axis_name = 'X'
+        elif tracking_axis == 'Y' and current_y is not None:
+            current_pos = current_y
+            axis_name = 'Y'
+        else:
+            current_pos = None
+            axis_name = None
+        
+        if current_pos is not None:
+            logger.info(f"🔍 Current {axis_name}={current_pos:.3f}, checking history...")
+            # Calculate direction by comparing with recent detections
+            if len(detection_history) >= 1:
+                # Get recent positions within configured time window
+                recent_positions = [d for d in detection_history 
+                                  if (current_time - d['timestamp']).total_seconds() < HISTORY_TIME_WINDOW]
+                
+                logger.info(f"🔍 Found {len(recent_positions)} recent positions within {HISTORY_TIME_WINDOW}s window")
+                
+                if recent_positions:
+                    # Compare current position to average of recent positions
+                    if tracking_axis == 'X':
+                        avg_recent = sum(d['x'] for d in recent_positions) / len(recent_positions)
+                    else:  # Y axis
+                        avg_recent = sum(d['y'] for d in recent_positions) / len(recent_positions)
+                    
+                    pos_diff = current_pos - avg_recent
+                    
+                    logger.info(f"🔍 Avg Recent {axis_name}={avg_recent:.3f}, Current {axis_name}={current_pos:.3f}, Diff={pos_diff:.3f}")
+                    
+                    # Determine direction based on movement
+                    if abs(pos_diff) > MOVEMENT_THRESHOLD:  # Significant movement threshold
+                        # For vertical lines: 
+                        #   B side = LEFT (small X), A side = RIGHT (large X)
+                        #   A→B = RIGHT to LEFT = X decreasing = ENTER
+                        #   B→A = LEFT to RIGHT = X increasing = EXIT
+                        # For horizontal lines:
+                        #   A side = TOP (small Y), B side = BOTTOM (large Y)
+                        #   A→B = TOP to BOTTOM = Y increasing = ENTER
+                        #   B→A = BOTTOM to TOP = Y decreasing = EXIT
+                        
+                        if tracking_axis == 'X':
+                            # Vertical line: X decreasing = A→B = ENTER
+                            is_enter = pos_diff < 0
+                        else:
+                            # Horizontal line: Y increasing = A→B = ENTER
+                            is_enter = pos_diff > 0
+                        
+                        if is_enter:
+                            # A→B = ENTER
+                            if 'vehicle' in detection_target.lower():
+                                direction_text = 'Vehicle Enter'
+                            elif 'human' in detection_target.lower():
+                                direction_text = 'Human Enter'
+                            else:
+                                direction_text = 'Object Enter'
+                        else:
+                            # B→A = EXIT
+                            if 'vehicle' in detection_target.lower():
+                                direction_text = 'Vehicle Exit'
+                            elif 'human' in detection_target.lower():
+                                direction_text = 'Human Exit'
+                            else:
+                                direction_text = 'Object Exit'
+                        
+                        logger.info(f"📍 Direction calculated: {axis_name}={current_pos:.3f}, Avg={avg_recent:.3f}, Diff={pos_diff:.3f} → {direction_text}")
+                    else:
+                        # Movement too small, show position
+                        calculated_side = linedata.get('calculated_side', '')
+                        direction_text = calculated_side if calculated_side else 'Minimal movement'
+                        logger.info(f"🔍 Movement too small ({pos_diff:.3f} < {MOVEMENT_THRESHOLD}), showing position: {direction_text}")
+                else:
+                    # First detection after long gap, show position
+                    calculated_side = linedata.get('calculated_side', '')
+                    direction_text = calculated_side if calculated_side else 'No recent history'
+                    logger.info(f"🔍 No recent positions in window, showing position: {direction_text}")
+            else:
+                # Not enough history yet, show position
+                calculated_side = linedata.get('calculated_side', '')
+                direction_text = calculated_side if calculated_side else 'Initializing...'
+                logger.info(f"🔍 Not enough history ({len(detection_history)}), showing: {direction_text}")
+            
+            # Add current detection to history (store both X and Y for flexibility)
+            detection_history.append({
+                'timestamp': current_time,
+                'x': current_x if current_x is not None else 0.0,
+                'y': current_y if current_y is not None else 0.0,
+                'target': detection_target
+            })
+        else:
+            # No valid position coordinate
+            logger.warning(f"🔍 No valid position coordinate for tracking (axis={tracking_axis}, X={current_x}, Y={current_y})")
+            direction_text = 'Direction Not Available'
+    except Exception as e:
+        logger.error(f"Error calculating direction: {e}", exc_info=True)
+        direction_text = 'Direction Error'
+    
+    logger.info(f"✅ Final direction text: '{direction_text}'")
+    
+    update_openhab_item('LineCrossing_Direction', direction_text)
+    
+    update_openhab_item('LineCrossing_TargetX', linedata.get('target_x', '0'))
+    update_openhab_item('LineCrossing_TargetY', linedata.get('target_y', '0'))
+    update_openhab_item('LineCrossing_TargetWidth', linedata.get('target_width', '0'))
+    update_openhab_item('LineCrossing_TargetHeight', linedata.get('target_height', '0'))
+    
+    # Detection line and settings
+    update_openhab_item('LineCrossing_LineCoordinates', linedata.get('line_coordinates', ''))
+    update_openhab_item('LineCrossing_RegionID', linedata.get('region_id', '0'))
+    update_openhab_item('LineCrossing_Sensitivity', linedata.get('sensitivity', '0'))
+    
+    camera_ip = linedata.get('camera_ip', 'unknown')
+    object_type = linedata.get('object_type', 'unknown')
+    direction = linedata.get('direction', 'no direction')
+    logger.info(f"✅ Updated OpenHAB line crossing items - Camera: {camera_ip}, Object: {object_type}, Direction: {direction}")
+
+
+def save_linedetection_image(jpeg_data, timestamp_str):
+    """
+    Save line crossing detection image to HTML folder
+    Args:
+        jpeg_data: JPEG image bytes
+        timestamp_str: Detection timestamp string
+    """
+    try:
+        # Generate filename based on timestamp
+        if timestamp_str:
+            try:
+                dt = datetime.fromisoformat(timestamp_str.replace('+01:00', '').replace('+00:00', '').replace('+02:00', ''))
+                filename = f"linecrossing_{dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+                time_string = dt.strftime('%H:%M:%S')
+            except (ValueError, AttributeError) as e:
+                logger.debug(f"Error parsing timestamp '{timestamp_str}': {e}")
+                filename = f"linecrossing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                time_string = datetime.now().strftime('%H:%M:%S')
+        else:
+            filename = f"linecrossing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            time_string = datetime.now().strftime('%H:%M:%S')
+        
+        # Save timestamped image (atomically to prevent corruption)
+        image_path = os.path.join(HTML_OUTPUT_PATH, filename)
+        with tempfile.NamedTemporaryFile(mode='wb', dir=HTML_OUTPUT_PATH, delete=False) as tmp:
+            tmp.write(jpeg_data)
+            temp_path = tmp.name
+        os.rename(temp_path, image_path)
+        logger.info(f"✅ Saved line crossing image: {image_path} ({len(jpeg_data)} bytes)")
+        
+        # Also save as latest image for HTML viewer (atomically)
+        latest_path = os.path.join(HTML_OUTPUT_PATH, "linecrossing_latest.jpg")
+        with tempfile.NamedTemporaryFile(mode='wb', dir=HTML_OUTPUT_PATH, delete=False) as tmp:
+            tmp.write(jpeg_data)
+            temp_path = tmp.name
+        os.rename(temp_path, latest_path)
+        
+        # Save timestamp for HTML viewer (atomically)
+        timestamp_path = os.path.join(HTML_OUTPUT_PATH, "linecrossing_latest_time.txt")
+        with tempfile.NamedTemporaryFile(mode='w', dir=HTML_OUTPUT_PATH, delete=False) as tmp:
+            tmp.write(time_string)
+            temp_path = tmp.name
+        os.rename(temp_path, timestamp_path)
+        
+        # Update OpenHAB item with filename
+        update_openhab_item('LineCrossing_ImageFilename', filename)
+        
+    except Exception as e:
+        logger.error(f"Error saving line crossing image: {e}")
 
 
 def process_analytics(analytics):
@@ -278,10 +769,11 @@ def process_analytics(analytics):
     if timestamp:
         # Format: 2026-02-08T08:29:23+01:00
         try:
-            dt = datetime.fromisoformat(timestamp.replace('+01:00', ''))
+            dt = datetime.fromisoformat(timestamp.replace('+01:00', '').replace('+00:00', '').replace('+02:00', ''))
             formatted_time = dt.strftime('%d-%m-%Y kl %H:%M')
             update_openhab_item('Hikvision_Timestamp', formatted_time)
-        except:
+        except (ValueError, AttributeError) as e:
+            logger.debug(f"Error parsing timestamp '{timestamp}': {e}")
             update_openhab_item('Hikvision_Timestamp', timestamp)
     
     # Clothing
@@ -336,7 +828,7 @@ def process_analytics(analytics):
     logger.info(f"✅ Updated OpenHAB items - {gender} {age_group} (age {age}), {face_expression}, {jacket_color} jacket, {trousers_color} trousers, direction: {direction}")
 
 
-@app.route('/webhook', methods=['POST', 'PUT', 'GET'])
+@app.route('/webhook', methods=['POST'])
 def webhook():
     """Handle incoming webhook from Hikvision camera"""
     try:
@@ -345,13 +837,13 @@ def webhook():
         # Get raw content as bytes (for image extraction)
         content_bytes = request.get_data()
         
-        # Also get as text for JSON parsing
+        # Also get as text for JSON/XML parsing
         content_text = content_bytes.decode('utf-8', errors='ignore')
         
         # Save raw webhook to file for analysis (when debugging)
         if LOG_WEBHOOKS and content_text:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            webhook_file = f'/etc/openhab/hikvision-analytics/webhook_{timestamp}.txt'
+            webhook_file = os.path.join(WEBHOOK_DIR, f'webhook_{timestamp}.txt')
             with open(webhook_file, 'w') as f:
                 f.write(content_text)
             logger.debug(f"Saved webhook to: {webhook_file}")
@@ -360,41 +852,83 @@ def webhook():
             # Cleanup old webhook files
             cleanup_old_webhooks()
         
-        # Extract analytics and background image from webhook
-        analytics, background_image = extract_analytics_from_webhook_bytes(content_text, content_bytes)
-        
-        if analytics:
-            logger.info("Analytics extracted successfully")
-            logger.debug(f"Extracted data: {analytics}")
+        # Determine event type: line crossing detection (Camera 2) or body detection (Camera 1)
+        if 'linedetection' in content_text or '<eventType>linedetection</eventType>' in content_text:
+            # ==================== CAMERA 2: LINE CROSSING DETECTION ====================
+            logger.info("📍 Detected LINE CROSSING event from Camera 2")
             
-            # Update OpenHAB items
-            process_analytics(analytics)
+            linedata, jpeg_image = extract_linedetection_from_xml(content_text, content_bytes)
             
-            # Save background image if extracted
-            if background_image:
-                detection_timestamp = analytics.get('human_snapTime') or analytics.get('face_snapTime', '')
-                if detection_timestamp:
-                    # Format timestamp for display (HH:MM:SS)
-                    try:
-                        dt = datetime.fromisoformat(detection_timestamp.replace('+01:00', '').replace('+00:00', ''))
-                        timestamp_display = dt.strftime('%Y-%m-%d %H:%M:%S')
-                    except:
-                        timestamp_display = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    save_detection_image(background_image, timestamp_display)
+            if linedata:
+                logger.info("Line crossing data extracted successfully")
+                logger.debug(f"Extracted line data: {linedata}")
+                
+                # Update OpenHAB items
+                process_linedetection(linedata)
+                
+                # Save detection image if extracted
+                if jpeg_image:
+                    timestamp_str = linedata.get('datetime', '')
+                    save_linedetection_image(jpeg_image, timestamp_str)
                 else:
-                    # Use current time if no timestamp in analytics
-                    timestamp_display = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    save_detection_image(background_image, timestamp_display)
+                    logger.warning("No image found in line crossing webhook")
             else:
-                logger.warning("No background image found in webhook")
+                logger.warning("No line crossing data found in webhook")
+                
+            camera_name = CAMERA_LINE.get('name', 'Camera 2')
+            camera_ip = CAMERA_LINE.get('ip', '10.0.11.102')
+            return {
+                "status": "ok",
+                "event_type": "linedetection",
+                "camera": f"{camera_name} ({camera_ip})",
+                "timestamp": datetime.now().isoformat(),
+                "data_found": linedata is not None
+            }, 200
+            
         else:
-            logger.warning("No analytics found in webhook")
-        
-        return {
-            "status": "ok",
-            "timestamp": datetime.now().isoformat(),
-            "analytics_found": analytics is not None
-        }, 200
+            # ==================== CAMERA 1: BODY DETECTION (ORIGINAL) ====================
+            logger.info("👤 Detected BODY DETECTION event from Camera 1")
+            
+            # Extract analytics and background image from webhook
+            analytics, background_image = extract_analytics_from_webhook_bytes(content_text, content_bytes)
+            
+            if analytics:
+                logger.info("Analytics extracted successfully")
+                logger.debug(f"Extracted data: {analytics}")
+                
+                # Update OpenHAB items
+                process_analytics(analytics)
+                
+                # Save background image if extracted
+                if background_image:
+                    detection_timestamp = analytics.get('human_snapTime') or analytics.get('face_snapTime', '')
+                    if detection_timestamp:
+                        # Format timestamp for display (HH:MM:SS)
+                        try:
+                            dt = datetime.fromisoformat(detection_timestamp.replace('+01:00', '').replace('+00:00', '').replace('+02:00', ''))
+                            timestamp_display = dt.strftime('%Y-%m-%d %H:%M:%S')
+                        except (ValueError, AttributeError) as e:
+                            logger.debug(f"Error parsing detection timestamp '{detection_timestamp}': {e}")
+                            timestamp_display = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        save_detection_image(background_image, timestamp_display)
+                    else:
+                        # Use current time if no timestamp in analytics
+                        timestamp_display = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        save_detection_image(background_image, timestamp_display)
+                else:
+                    logger.warning("No background image found in webhook")
+            else:
+                logger.warning("No analytics found in webhook")
+            
+            camera_name = CAMERA_BODY.get('name', 'Camera 1')
+            camera_ip = CAMERA_BODY.get('ip', '10.0.11.101')
+            return {
+                "status": "ok",
+                "event_type": "body_detection",
+                "camera": f"{camera_name} ({camera_ip})",
+                "timestamp": datetime.now().isoformat(),
+                "analytics_found": analytics is not None
+            }, 200
         
     except Exception as e:
         logger.error(f"Error processing webhook: {e}", exc_info=True)
@@ -418,9 +952,10 @@ def health():
     """Health check endpoint"""
     try:
         # Test OpenHAB connection
-        response = requests.get(f"{OPENHAB_URL}/rest/items", timeout=2)
+        response = requests.get(f"{OPENHAB_URL}/rest/items", timeout=OPENHAB_HEALTH_TIMEOUT)
         openhab_ok = response.status_code == 200
-    except:
+    except Exception as e:
+        logger.debug(f"OpenHAB health check failed: {e}")
         openhab_ok = False
     
     return {
@@ -431,9 +966,20 @@ def health():
 
 
 if __name__ == '__main__':
+    # Ensure required directories exist before starting
+    try:
+        os.makedirs(WEBHOOK_DIR, exist_ok=True)
+        os.makedirs(HTML_OUTPUT_PATH, exist_ok=True)
+        logger.info(f"✅ Verified directories exist: {WEBHOOK_DIR}, {HTML_OUTPUT_PATH}")
+    except Exception as dir_err:
+        logger.error(f"❌ Failed to create required directories: {dir_err}")
+        import sys
+        sys.exit(1)
+    
     logger.info("=" * 70)
     logger.info("Hikvision Webhook Analytics Processor Starting")
     logger.info("=" * 70)
+    logger.info(f"Configuration loaded from: {CONFIG_FILE}")
     logger.info(f"Listening on: http://0.0.0.0:{WEBHOOK_PORT}")
     logger.info(f"OpenHAB URL: {OPENHAB_URL}")
     logger.info(f"Webhook endpoint: POST http://0.0.0.0:{WEBHOOK_PORT}/webhook")
@@ -441,6 +987,13 @@ if __name__ == '__main__':
     logger.info(f"Health endpoint: GET http://0.0.0.0:{WEBHOOK_PORT}/health")
     logger.info(f"Webhook logging: {'Enabled' if LOG_WEBHOOKS else 'Disabled'}")
     logger.info(f"Max webhook files: {MAX_WEBHOOK_FILES} (auto-cleanup enabled)")
+    logger.info("-" * 70)
+    logger.info(f"Camera 1 (Body Detection): {CAMERA_BODY.get('name', 'Unknown')} - {CAMERA_BODY.get('ip', 'Unknown')}")
+    logger.info(f"Camera 2 (Line Crossing): {CAMERA_LINE.get('name', 'Unknown')} - {CAMERA_LINE.get('ip', 'Unknown')}")
+    logger.info("-" * 70)
+    logger.info(f"Detection Settings:")
+    logger.info(f"  Movement threshold: {MOVEMENT_THRESHOLD*100:.1f}% | Position margin: {POSITION_MARGIN*100:.1f}%")
+    logger.info(f"  History: {HISTORY_BUFFER_SIZE} detections | Time window: {HISTORY_TIME_WINDOW}s")
     logger.info("=" * 70)
     
     app.run(host='0.0.0.0', port=WEBHOOK_PORT, debug=False)
