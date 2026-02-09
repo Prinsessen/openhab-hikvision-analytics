@@ -40,6 +40,10 @@ WEBHOOK_DIR = CONFIG.get('paths', {}).get('webhook_dir', "/etc/openhab/hikvision
 HTML_OUTPUT_PATH = CONFIG.get('paths', {}).get('html_output', "/etc/openhab/html")
 IMAGE_FILENAME = CONFIG.get('files', {}).get('body_detection_image', "hikvision_latest.jpg")
 TIMESTAMP_FILENAME = CONFIG.get('files', {}).get('body_detection_timestamp', "hikvision_latest_time.txt")
+LINE_CROSSING_IMAGE = CONFIG.get('files', {}).get('line_crossing_image', "linecrossing_latest.jpg")
+LINE_CROSSING_TIMESTAMP = CONFIG.get('files', {}).get('line_crossing_timestamp', "linecrossing_latest_time.txt")
+# Extract prefix for timestamped line crossing files (remove '_latest.jpg' from filename)
+LINE_CROSSING_PREFIX = LINE_CROSSING_IMAGE.replace('_latest.jpg', '').replace('.jpg', '')
 
 # Detection configuration
 MOVEMENT_THRESHOLD = CONFIG.get('detection', {}).get('movement_threshold', 0.015)
@@ -51,6 +55,54 @@ CAMERA_RESOLUTION = CONFIG.get('detection', {}).get('camera_resolution', {'width
 # Camera configuration from JSON
 CAMERA_BODY = CONFIG.get('cameras', {}).get('body_detection', {})
 CAMERA_LINE = CONFIG.get('cameras', {}).get('line_crossing', {})
+
+# OpenHAB Item Names from config (with fallbacks)
+body_items = CONFIG.get('items', {}).get('body_detection', {})
+line_items = CONFIG.get('items', {}).get('line_crossing', {})
+
+# Body detection item names
+ITEM_CHANNEL_NAME = body_items.get('channel_name', 'Hikvision_ChannelName')
+ITEM_EVENT_TYPE = body_items.get('event_type', 'Hikvision_EventType')
+ITEM_TIMESTAMP = body_items.get('timestamp', 'Hikvision_Timestamp')
+ITEM_JACKET_COLOR = body_items.get('jacket_color', 'Hikvision_JacketColor')
+ITEM_TROUSERS_COLOR = body_items.get('trousers_color', 'Hikvision_TrousersColor')
+ITEM_JACKET_TYPE = body_items.get('jacket_type', 'Hikvision_JacketType')
+ITEM_TROUSERS_TYPE = body_items.get('trousers_type', 'Hikvision_TrousersType')
+ITEM_HAS_HAT = body_items.get('has_hat', 'Hikvision_HasHat')
+ITEM_HAS_GLASSES = body_items.get('has_glasses', 'Hikvision_HasGlasses')
+ITEM_HAS_BAG = body_items.get('has_bag', 'Hikvision_HasBag')
+ITEM_HAS_THINGS = body_items.get('has_things', 'Hikvision_HasThings')
+ITEM_HAS_MASK = body_items.get('has_mask', 'Hikvision_HasMask')
+ITEM_RIDE = body_items.get('ride', 'Hikvision_Ride')
+ITEM_GENDER = body_items.get('gender', 'Hikvision_Gender')
+ITEM_AGE = body_items.get('age', 'Hikvision_Age')
+ITEM_AGE_GROUP = body_items.get('age_group', 'Hikvision_AgeGroup')
+ITEM_HAIR_STYLE = body_items.get('hair_style', 'Hikvision_HairStyle')
+ITEM_FACE_EXPRESSION = body_items.get('face_expression', 'Hikvision_FaceExpression')
+ITEM_MOTION_DIRECTION = body_items.get('motion_direction', 'Hikvision_MotionDirection')
+ITEM_FACE_SCORE = body_items.get('face_score', 'Hikvision_FaceScore')
+ITEM_HUMAN_SCORE = body_items.get('human_score', 'Hikvision_HumanScore')
+
+# Line crossing item names
+ITEM_LC_EVENT_TYPE = line_items.get('event_type', 'LineCrossing_EventType')
+ITEM_LC_EVENT_STATE = line_items.get('event_state', 'LineCrossing_EventState')
+ITEM_LC_EVENT_DESCRIPTION = line_items.get('event_description', 'LineCrossing_EventDescription')
+ITEM_LC_DETECTION_TIME = line_items.get('detection_time', 'LineCrossing_DetectionTime')
+ITEM_LC_CAMERA_IP = line_items.get('camera_ip', 'LineCrossing_CameraIP')
+ITEM_LC_CAMERA_MAC = line_items.get('camera_mac', 'LineCrossing_CameraMAC')
+ITEM_LC_CHANNEL_ID = line_items.get('channel_id', 'LineCrossing_ChannelID')
+ITEM_LC_CHANNEL_NAME = line_items.get('channel_name', 'LineCrossing_ChannelName')
+ITEM_LC_DETECTION_TARGET = line_items.get('detection_target', 'LineCrossing_DetectionTarget')
+ITEM_LC_OBJECT_TYPE = line_items.get('object_type', 'LineCrossing_ObjectType')
+ITEM_LC_DIRECTION = line_items.get('direction', 'LineCrossing_Direction')
+ITEM_LC_TARGET_X = line_items.get('target_x', 'LineCrossing_TargetX')
+ITEM_LC_TARGET_Y = line_items.get('target_y', 'LineCrossing_TargetY')
+ITEM_LC_TARGET_WIDTH = line_items.get('target_width', 'LineCrossing_TargetWidth')
+ITEM_LC_TARGET_HEIGHT = line_items.get('target_height', 'LineCrossing_TargetHeight')
+ITEM_LC_LINE_COORDINATES = line_items.get('line_coordinates', 'LineCrossing_LineCoordinates')
+ITEM_LC_REGION_ID = line_items.get('region_id', 'LineCrossing_RegionID')
+ITEM_LC_SENSITIVITY = line_items.get('sensitivity', 'LineCrossing_Sensitivity')
+ITEM_LC_IMAGE_FILENAME = line_items.get('image_filename', 'LineCrossing_ImageFilename')
 
 # Setup logging (must be before validation)
 logging.basicConfig(
@@ -536,9 +588,9 @@ def process_linedetection(linedata):
     logger.info("Processing line crossing detection data...")
     
     # Event information
-    update_openhab_item('LineCrossing_EventType', linedata.get('event_type', ''))
-    update_openhab_item('LineCrossing_EventState', linedata.get('event_state', ''))
-    update_openhab_item('LineCrossing_EventDescription', linedata.get('event_description', ''))
+    update_openhab_item(ITEM_LC_EVENT_TYPE, linedata.get('event_type', ''))
+    update_openhab_item(ITEM_LC_EVENT_STATE, linedata.get('event_state', ''))
+    update_openhab_item(ITEM_LC_EVENT_DESCRIPTION, linedata.get('event_description', ''))
     
     # Update timestamp (convert to DateTime format)
     datetime_str = linedata.get('datetime', '')
@@ -547,21 +599,21 @@ def process_linedetection(linedata):
             # Parse ISO format: 2026-02-09T07:39:01+01:00
             dt_obj = datetime.fromisoformat(datetime_str.replace('+01:00', '').replace('+00:00', '').replace('+02:00', ''))
             # Format for OpenHAB DateTime item: ISO 8601
-            update_openhab_item('LineCrossing_DetectionTime', dt_obj.isoformat())
+            update_openhab_item(ITEM_LC_DETECTION_TIME, dt_obj.isoformat())
         except Exception as e:
             logger.warning(f"Could not parse datetime: {datetime_str}, error: {e}")
     
     # Camera information
-    update_openhab_item('LineCrossing_CameraIP', linedata.get('camera_ip', ''))
-    update_openhab_item('LineCrossing_CameraMAC', linedata.get('camera_mac', ''))
-    update_openhab_item('LineCrossing_ChannelID', linedata.get('channel_id', '0'))
-    update_openhab_item('LineCrossing_ChannelName', linedata.get('channel_name', ''))
+    update_openhab_item(ITEM_LC_CAMERA_IP, linedata.get('camera_ip', ''))
+    update_openhab_item(ITEM_LC_CAMERA_MAC, linedata.get('camera_mac', ''))
+    update_openhab_item(ITEM_LC_CHANNEL_ID, linedata.get('channel_id', '0'))
+    update_openhab_item(ITEM_LC_CHANNEL_NAME, linedata.get('channel_name', ''))
     
     # Detection target and position
     detection_target = linedata.get('detection_target', '')
     object_type = linedata.get('object_type', 'Unknown')
-    update_openhab_item('LineCrossing_DetectionTarget', detection_target)
-    update_openhab_item('LineCrossing_ObjectType', object_type)
+    update_openhab_item(ITEM_LC_DETECTION_TARGET, detection_target)
+    update_openhab_item(ITEM_LC_OBJECT_TYPE, object_type)
     
     # Calculate direction from position history
     target_x = linedata.get('target_x', '')
@@ -678,17 +730,17 @@ def process_linedetection(linedata):
     
     logger.info(f"✅ Final direction text: '{direction_text}'")
     
-    update_openhab_item('LineCrossing_Direction', direction_text)
+    update_openhab_item(ITEM_LC_DIRECTION, direction_text)
     
-    update_openhab_item('LineCrossing_TargetX', linedata.get('target_x', '0'))
-    update_openhab_item('LineCrossing_TargetY', linedata.get('target_y', '0'))
-    update_openhab_item('LineCrossing_TargetWidth', linedata.get('target_width', '0'))
-    update_openhab_item('LineCrossing_TargetHeight', linedata.get('target_height', '0'))
+    update_openhab_item(ITEM_LC_TARGET_X, linedata.get('target_x', '0'))
+    update_openhab_item(ITEM_LC_TARGET_Y, linedata.get('target_y', '0'))
+    update_openhab_item(ITEM_LC_TARGET_WIDTH, linedata.get('target_width', '0'))
+    update_openhab_item(ITEM_LC_TARGET_HEIGHT, linedata.get('target_height', '0'))
     
     # Detection line and settings
-    update_openhab_item('LineCrossing_LineCoordinates', linedata.get('line_coordinates', ''))
-    update_openhab_item('LineCrossing_RegionID', linedata.get('region_id', '0'))
-    update_openhab_item('LineCrossing_Sensitivity', linedata.get('sensitivity', '0'))
+    update_openhab_item(ITEM_LC_LINE_COORDINATES, linedata.get('line_coordinates', ''))
+    update_openhab_item(ITEM_LC_REGION_ID, linedata.get('region_id', '0'))
+    update_openhab_item(ITEM_LC_SENSITIVITY, linedata.get('sensitivity', '0'))
     
     camera_ip = linedata.get('camera_ip', 'unknown')
     object_type = linedata.get('object_type', 'unknown')
@@ -708,14 +760,14 @@ def save_linedetection_image(jpeg_data, timestamp_str):
         if timestamp_str:
             try:
                 dt = datetime.fromisoformat(timestamp_str.replace('+01:00', '').replace('+00:00', '').replace('+02:00', ''))
-                filename = f"linecrossing_{dt.strftime('%Y%m%d_%H%M%S')}.jpg"
+                filename = f"{LINE_CROSSING_PREFIX}_{dt.strftime('%Y%m%d_%H%M%S')}.jpg"
                 time_string = dt.strftime('%H:%M:%S')
             except (ValueError, AttributeError) as e:
                 logger.debug(f"Error parsing timestamp '{timestamp_str}': {e}")
-                filename = f"linecrossing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                filename = f"{LINE_CROSSING_PREFIX}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
                 time_string = datetime.now().strftime('%H:%M:%S')
         else:
-            filename = f"linecrossing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            filename = f"{LINE_CROSSING_PREFIX}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
             time_string = datetime.now().strftime('%H:%M:%S')
         
         # Save timestamped image (atomically to prevent corruption)
@@ -727,21 +779,21 @@ def save_linedetection_image(jpeg_data, timestamp_str):
         logger.info(f"✅ Saved line crossing image: {image_path} ({len(jpeg_data)} bytes)")
         
         # Also save as latest image for HTML viewer (atomically)
-        latest_path = os.path.join(HTML_OUTPUT_PATH, "linecrossing_latest.jpg")
+        latest_path = os.path.join(HTML_OUTPUT_PATH, LINE_CROSSING_IMAGE)
         with tempfile.NamedTemporaryFile(mode='wb', dir=HTML_OUTPUT_PATH, delete=False) as tmp:
             tmp.write(jpeg_data)
             temp_path = tmp.name
         os.rename(temp_path, latest_path)
         
         # Save timestamp for HTML viewer (atomically)
-        timestamp_path = os.path.join(HTML_OUTPUT_PATH, "linecrossing_latest_time.txt")
+        timestamp_path = os.path.join(HTML_OUTPUT_PATH, LINE_CROSSING_TIMESTAMP)
         with tempfile.NamedTemporaryFile(mode='w', dir=HTML_OUTPUT_PATH, delete=False) as tmp:
             tmp.write(time_string)
             temp_path = tmp.name
         os.rename(temp_path, timestamp_path)
         
         # Update OpenHAB item with filename
-        update_openhab_item('LineCrossing_ImageFilename', filename)
+        update_openhab_item(ITEM_LC_IMAGE_FILENAME, filename)
         
     except Exception as e:
         logger.error(f"Error saving line crossing image: {e}")
@@ -761,8 +813,8 @@ def process_analytics(analytics):
     # Camera/Event info
     channel_name = analytics.get('channelName', 'unknown')
     event_type = analytics.get('eventType', 'unknown')
-    update_openhab_item('Hikvision_ChannelName', channel_name)
-    update_openhab_item('Hikvision_EventType', event_type)
+    update_openhab_item(ITEM_CHANNEL_NAME, channel_name)
+    update_openhab_item(ITEM_EVENT_TYPE, event_type)
     
     # Use Human data preferentially (more reliable), fallback to Face
     timestamp = analytics.get('human_snapTime') or analytics.get('face_snapTime', '')
@@ -771,10 +823,10 @@ def process_analytics(analytics):
         try:
             dt = datetime.fromisoformat(timestamp.replace('+01:00', '').replace('+00:00', '').replace('+02:00', ''))
             formatted_time = dt.strftime('%d-%m-%Y kl %H:%M')
-            update_openhab_item('Hikvision_Timestamp', formatted_time)
+            update_openhab_item(ITEM_TIMESTAMP, formatted_time)
         except (ValueError, AttributeError) as e:
             logger.debug(f"Error parsing timestamp '{timestamp}': {e}")
-            update_openhab_item('Hikvision_Timestamp', timestamp)
+            update_openhab_item(ITEM_TIMESTAMP, timestamp)
     
     # Clothing
     jacket_color = analytics.get('human_jacketColor', 'unknown')
@@ -782,10 +834,10 @@ def process_analytics(analytics):
     jacket_type = analytics.get('human_jacketType', 'unknown')
     trousers_type = analytics.get('human_trousersType', 'unknown')
     
-    update_openhab_item('Hikvision_JacketColor', jacket_color)
-    update_openhab_item('Hikvision_TrousersColor', trousers_color)
-    update_openhab_item('Hikvision_JacketType', jacket_type)
-    update_openhab_item('Hikvision_TrousersType', trousers_type)
+    update_openhab_item(ITEM_JACKET_COLOR, jacket_color)
+    update_openhab_item(ITEM_TROUSERS_COLOR, trousers_color)
+    update_openhab_item(ITEM_JACKET_TYPE, jacket_type)
+    update_openhab_item(ITEM_TROUSERS_TYPE, trousers_type)
     
     # Accessories - convert yes/no to ON/OFF
     hat = analytics.get('human_hat') or analytics.get('face_hat', 'no')
@@ -795,12 +847,12 @@ def process_analytics(analytics):
     mask = analytics.get('human_mask') or analytics.get('face_mask', 'no')
     ride = analytics.get('human_ride', 'no')
     
-    update_openhab_item('Hikvision_HasHat', 'ON' if hat == 'yes' else 'OFF')
-    update_openhab_item('Hikvision_HasGlasses', 'ON' if glasses == 'yes' else 'OFF')
-    update_openhab_item('Hikvision_HasBag', 'ON' if bag == 'yes' else 'OFF')
-    update_openhab_item('Hikvision_HasThings', 'ON' if things == 'yes' else 'OFF')
-    update_openhab_item('Hikvision_HasMask', 'ON' if mask == 'yes' else 'OFF')
-    update_openhab_item('Hikvision_Ride', 'ON' if ride == 'yes' else 'OFF')
+    update_openhab_item(ITEM_HAS_HAT, 'ON' if hat == 'yes' else 'OFF')
+    update_openhab_item(ITEM_HAS_GLASSES, 'ON' if glasses == 'yes' else 'OFF')
+    update_openhab_item(ITEM_HAS_BAG, 'ON' if bag == 'yes' else 'OFF')
+    update_openhab_item(ITEM_HAS_THINGS, 'ON' if things == 'yes' else 'OFF')
+    update_openhab_item(ITEM_HAS_MASK, 'ON' if mask == 'yes' else 'OFF')
+    update_openhab_item(ITEM_RIDE, 'ON' if ride == 'yes' else 'OFF')
     
     # Person attributes
     gender = analytics.get('human_gender') or analytics.get('face_gender', 'unknown')
@@ -809,21 +861,21 @@ def process_analytics(analytics):
     face_expression = analytics.get('face_faceExpression', 'unknown')
     age = analytics.get('face_age', '0')
     
-    update_openhab_item('Hikvision_Gender', gender)
-    update_openhab_item('Hikvision_AgeGroup', age_group)
-    update_openhab_item('Hikvision_HairStyle', hair_style)
-    update_openhab_item('Hikvision_FaceExpression', face_expression)
-    update_openhab_item('Hikvision_Age', age)
+    update_openhab_item(ITEM_GENDER, gender)
+    update_openhab_item(ITEM_AGE_GROUP, age_group)
+    update_openhab_item(ITEM_HAIR_STYLE, hair_style)
+    update_openhab_item(ITEM_FACE_EXPRESSION, face_expression)
+    update_openhab_item(ITEM_AGE, age)
     
     # Motion
     direction = analytics.get('human_direction', 'unknown')
-    update_openhab_item('Hikvision_MotionDirection', direction)
+    update_openhab_item(ITEM_MOTION_DIRECTION, direction)
     
     # Detection quality scores
     face_score = analytics.get('face_score', '0')
     human_score = analytics.get('human_score', '0')
-    update_openhab_item('Hikvision_FaceScore', face_score)
-    update_openhab_item('Hikvision_HumanScore', human_score)
+    update_openhab_item(ITEM_FACE_SCORE, face_score)
+    update_openhab_item(ITEM_HUMAN_SCORE, human_score)
     
     logger.info(f"✅ Updated OpenHAB items - {gender} {age_group} (age {age}), {face_expression}, {jacket_color} jacket, {trousers_color} trousers, direction: {direction}")
 

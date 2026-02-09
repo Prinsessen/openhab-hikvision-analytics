@@ -1,40 +1,110 @@
 {
   "service_name": "Hikvision Webhook Analytics Processor",
-  "version": "2.0",
-  "description": "Processes Hikvision camera webhooks and updates OpenHAB items with body detection analytics",
+  "version": "3.0",
+  "description": "Processes Hikvision camera webhooks and updates OpenHAB items with body detection and line crossing analytics",
   
   "webhook": {
     "port": 5001,
     "endpoint": "/webhook",
-    "log_webhooks": true
+    "log_webhooks": true,
+    "max_saved_files": 50
   },
   
   "openhab": {
     "url": "http://localhost:8080",
     "rest_api": "/rest/items",
-    "timeout_seconds": 5
+    "timeout_seconds": 5,
+    "health_check_timeout": 2
+  },
+  
+  "paths": {
+    "webhook_dir": "/etc/openhab/hikvision-analytics",
+    "html_output": "/etc/openhab/html"
+  },
+  
+  "files": {
+    "body_detection_image": "hikvision_latest.jpg",
+    "body_detection_timestamp": "hikvision_latest_time.txt",
+    "line_crossing_image": "linecrossing_latest.jpg",
+    "line_crossing_timestamp": "linecrossing_latest_time.txt"
+  },
+  
+  "detection": {
+    "movement_threshold": 0.015,
+    "position_margin": 0.02,
+    "history_time_window_seconds": 120,
+    "history_buffer_size": 5,
+    "camera_resolution": {
+      "width": 1280,
+      "height": 720
+    },
+    "notes": {
+      "movement_threshold": "Minimum movement (0-1 normalized) to trigger Enter/Exit vs Position fallback. 0.015 = 1.5% of frame",
+      "position_margin": "Margin around detection line (0-1 normalized) to determine A/B sides. 0.02 = 2% of frame",
+      "history_time_window_seconds": "How far back to look for position comparison. 120s for manual testing, 10-30s for production",
+      "history_buffer_size": "Number of recent detections to keep in memory buffer",
+      "camera_resolution": "Width and height used to normalize line coordinates from camera webhooks"
+    }
+  },
+  
+  "cameras": {
+    "body_detection": {
+      "ip": "YOUR_CAMERA_1_IP",
+      "mac": "YOUR_CAMERA_1_MAC",
+      "model": "DS-2DF8425IX-AEL",
+      "name": "Camera 1",
+      "event_type": "mixedTargetDetection",
+      "notes": "Body detection camera - Configure to send HTTP notification to http://SERVER_IP:5001/webhook"
+    },
+    "line_crossing": {
+      "ip": "YOUR_CAMERA_2_IP",
+      "mac": "YOUR_CAMERA_2_MAC",
+      "model": "DS-2CD2387G2P-LSU/SL",
+      "name": "Camera 2",
+      "event_type": "linedetection",
+      "notes": "Line crossing detection camera - Configure to send HTTP notification to http://SERVER_IP:5001/webhook"
+    }
   },
   
   "items": {
-    "timestamp": "Hikvision_Timestamp",
-    "jacket_color": "Hikvision_JacketColor",
-    "trousers_color": "Hikvision_TrousersColor",
-    "jacket_type": "Hikvision_JacketType",
-    "trousers_type": "Hikvision_TrousersType",
-    "has_hat": "Hikvision_HasHat",
-    "has_glasses": "Hikvision_HasGlasses",
-    "has_bag": "Hikvision_HasBag",
-    "has_things": "Hikvision_HasThings",
-    "has_mask": "Hikvision_HasMask",
-    "gender": "Hikvision_Gender",
-    "age_group": "Hikvision_AgeGroup",
-    "hair_style": "Hikvision_HairStyle",
-    "motion_direction": "Hikvision_MotionDirection"
-  },
-  
-  "camera": {
-    "ip": "YOUR_CAMERA_IP",
-    "model": "DS-2DF8425IX-AEL",
-    "notes": "Configure camera to send HTTP notification to http://YOUR_SERVER_IP:5001/webhook"
+    "body_detection": {
+      "timestamp": "Hikvision_Timestamp",
+      "channel_name": "Hikvision_ChannelName",
+      "event_type": "Hikvision_EventType",
+      "jacket_color": "Hikvision_JacketColor",
+      "trousers_color": "Hikvision_TrousersColor",
+      "jacket_type": "Hikvision_JacketType",
+      "trousers_type": "Hikvision_TrousersType",
+      "has_hat": "Hikvision_HasHat",
+      "has_glasses": "Hikvision_HasGlasses",
+      "has_bag": "Hikvision_HasBag",
+      "has_things": "Hikvision_HasThings",
+      "has_mask": "Hikvision_HasMask",
+      "gender": "Hikvision_Gender",
+      "age_group": "Hikvision_AgeGroup",
+      "hair_style": "Hikvision_HairStyle",
+      "motion_direction": "Hikvision_MotionDirection"
+    },
+    "line_crossing": {
+      "event_type": "LineCrossing_EventType",
+      "event_state": "LineCrossing_EventState",
+      "event_description": "LineCrossing_EventDescription",
+      "detection_time": "LineCrossing_DetectionTime",
+      "camera_ip": "LineCrossing_CameraIP",
+      "camera_mac": "LineCrossing_CameraMAC",
+      "channel_id": "LineCrossing_ChannelID",
+      "channel_name": "LineCrossing_ChannelName",
+      "detection_target": "LineCrossing_DetectionTarget",
+      "object_type": "LineCrossing_ObjectType",
+      "direction": "LineCrossing_Direction",
+      "target_x": "LineCrossing_TargetX",
+      "target_y": "LineCrossing_TargetY",
+      "target_width": "LineCrossing_TargetWidth",
+      "target_height": "LineCrossing_TargetHeight",
+      "line_coordinates": "LineCrossing_LineCoordinates",
+      "region_id": "LineCrossing_RegionID",
+      "sensitivity": "LineCrossing_Sensitivity",
+      "image_filename": "LineCrossing_ImageFilename"
+    }
   }
 }
