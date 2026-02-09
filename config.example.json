@@ -30,35 +30,36 @@
   },
   
   "detection": {
-    "movement_threshold": 0.015,
     "position_margin": 0.02,
-    "history_time_window_seconds": 120,
-    "history_buffer_size": 5,
+    "invert_direction": false,
+    "region_direction_mapping": {
+      "1": "enter",
+      "2": "exit"
+    },
     "camera_resolution": {
       "width": 1280,
       "height": 720
     },
     "notes": {
-      "movement_threshold": "Minimum movement (0-1 normalized) to trigger Enter/Exit vs Position fallback. 0.015 = 1.5% of frame",
-      "position_margin": "Margin around detection line (0-1 normalized) to determine A/B sides. 0.02 = 2% of frame",
-      "history_time_window_seconds": "How far back to look for position comparison. 120s for manual testing, 10-30s for production",
-      "history_buffer_size": "Number of recent detections to keep in memory buffer",
+      "position_margin": "Margin around detection line (0-1 normalized) to determine A/B sides for position-based fallback detection. 0.02 = 2% of frame",
+      "invert_direction": "Set true to swap Enter/Exit labels if they appear backwards. Applied AFTER region_direction_mapping",
+      "region_direction_mapping": "Map camera rule regionID to direction: enter or exit. PRIMARY method for direction detection. If regionID not found, falls back to position-based detection",
       "camera_resolution": "Width and height used to normalize line coordinates from camera webhooks"
     }
   },
   
   "cameras": {
     "body_detection": {
-      "ip": "YOUR_CAMERA_1_IP",
-      "mac": "YOUR_CAMERA_1_MAC",
+      "ip": "192.168.1.101",
+      "mac": "AA:BB:CC:DD:EE:01",
       "model": "DS-2DF8425IX-AEL",
       "name": "Camera 1",
       "event_type": "mixedTargetDetection",
       "notes": "Body detection camera - Configure to send HTTP notification to http://SERVER_IP:5001/webhook"
     },
     "line_crossing": {
-      "ip": "YOUR_CAMERA_2_IP",
-      "mac": "YOUR_CAMERA_2_MAC",
+      "ip": "192.168.1.102",
+      "mac": "AA:BB:CC:DD:EE:02",
       "model": "DS-2CD2387G2P-LSU/SL",
       "name": "Camera 2",
       "event_type": "linedetection",

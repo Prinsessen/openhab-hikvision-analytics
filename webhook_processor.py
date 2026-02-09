@@ -13,7 +13,6 @@ import os
 import glob
 import tempfile
 import xml.etree.ElementTree as ET
-from collections import deque
 
 # Load configuration from JSON file
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.json')
@@ -45,11 +44,11 @@ LINE_CROSSING_TIMESTAMP = CONFIG.get('files', {}).get('line_crossing_timestamp',
 # Extract prefix for timestamped line crossing files (remove '_latest.jpg' from filename)
 LINE_CROSSING_PREFIX = LINE_CROSSING_IMAGE.replace('_latest.jpg', '').replace('.jpg', '')
 
+# Detection configuration (target-specific thresholds for optimal detection)
 # Detection configuration
-MOVEMENT_THRESHOLD = CONFIG.get('detection', {}).get('movement_threshold', 0.015)
 POSITION_MARGIN = CONFIG.get('detection', {}).get('position_margin', 0.02)
-HISTORY_TIME_WINDOW = CONFIG.get('detection', {}).get('history_time_window_seconds', 120)
-HISTORY_BUFFER_SIZE = CONFIG.get('detection', {}).get('history_buffer_size', 5)
+INVERT_DIRECTION = CONFIG.get('detection', {}).get('invert_direction', False)
+REGION_DIRECTION_MAP = CONFIG.get('detection', {}).get('region_direction_mapping', {})
 CAMERA_RESOLUTION = CONFIG.get('detection', {}).get('camera_resolution', {'width': 1280, 'height': 720})
 
 # Camera configuration from JSON
@@ -112,18 +111,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Validate configuration values (after logger setup)
-if not (0 < MOVEMENT_THRESHOLD <= 1.0):
-    logger.warning(f"Invalid movement_threshold {MOVEMENT_THRESHOLD}, using default 0.015")
-    MOVEMENT_THRESHOLD = 0.015
 if not (0 < POSITION_MARGIN <= 1.0):
     logger.warning(f"Invalid position_margin {POSITION_MARGIN}, using default 0.02")
     POSITION_MARGIN = 0.02
-if HISTORY_TIME_WINDOW < 1:
-    logger.warning(f"Invalid history_time_window_seconds {HISTORY_TIME_WINDOW}, using default 120")
-    HISTORY_TIME_WINDOW = 120
-if HISTORY_BUFFER_SIZE < 1:
-    logger.warning(f"Invalid history_buffer_size {HISTORY_BUFFER_SIZE}, using default 5")
-    HISTORY_BUFFER_SIZE = 5
 
 # Validate CAMERA_RESOLUTION is a dict (must be after logger setup)
 if not isinstance(CAMERA_RESOLUTION, dict):
@@ -133,10 +123,6 @@ CAMERA_WIDTH = CAMERA_RESOLUTION.get('width', 1280)
 CAMERA_HEIGHT = CAMERA_RESOLUTION.get('height', 720)
 
 app = Flask(__name__)
-
-# Detection history for direction tracking (configurable buffer size)
-# Each entry: {'timestamp': datetime, 'x': float, 'y': float, 'target': str}
-detection_history = deque(maxlen=HISTORY_BUFFER_SIZE)
 
 
 def extract_analytics_from_webhook_bytes(content_text, content_bytes):
@@ -492,21 +478,25 @@ def extract_linedetection_from_xml(content_text, content_bytes):
         else:
             linedata['line_coordinates'] = ''
         
-        # Detect line orientation (vertical vs horizontal)
+        # Detect line orientation (vertical vs horizontal) and calculate line position
         linedata['line_orientation'] = 'unknown'
+        linedata['line_position'] = None  # Initialize
         if line_x1 is not None and line_y1 is not None and line_x2 is not None and line_y2 is not None:
             x_diff = abs(line_x1 - line_x2)
             y_diff = abs(line_y1 - line_y2)
             if y_diff > x_diff * 2:  # Y difference is much larger = vertical line
                 linedata['line_orientation'] = 'vertical'
                 linedata['tracking_axis'] = 'X'
+                linedata['line_position'] = (line_x1 + line_x2) / 2  # X position of vertical line
             elif x_diff > y_diff * 2:  # X difference is much larger = horizontal line
                 linedata['line_orientation'] = 'horizontal'
                 linedata['tracking_axis'] = 'Y'
+                linedata['line_position'] = (line_y1 + line_y2) / 2  # Y position of horizontal line
             else:
                 # Diagonal line: track axis with larger movement
                 linedata['line_orientation'] = 'diagonal'
                 linedata['tracking_axis'] = 'Y' if y_diff > x_diff else 'X'
+                linedata['line_position'] = (line_y1 + line_y2) / 2 if y_diff > x_diff else (line_x1 + line_x2) / 2
         
         # Target rectangle (normalized 0-1 coordinates)
         target_rect = root.find('.//TargetRect')
@@ -526,22 +516,21 @@ def extract_linedetection_from_xml(content_text, content_bytes):
             try:
                 target_x = float(linedata['target_x'])
                 target_y = float(linedata['target_y'])
+                line_position = linedata.get('line_position')
                 
-                if linedata['line_orientation'] == 'vertical' and line_x1 is not None:
+                if linedata['line_orientation'] == 'vertical' and line_position is not None:
                     # Vertical line: compare X positions
-                    line_center = (line_x1 + line_x2) / 2 if line_x2 else line_x1
-                    if target_x < line_center - POSITION_MARGIN:
+                    if target_x < line_position - POSITION_MARGIN:
                         linedata['calculated_side'] = 'Detected left side'
-                    elif target_x > line_center + POSITION_MARGIN:
+                    elif target_x > line_position + POSITION_MARGIN:
                         linedata['calculated_side'] = 'Detected right side'
                     else:
                         linedata['calculated_side'] = 'At detection line'
-                elif linedata['line_orientation'] == 'horizontal' and line_y1 is not None:
+                elif linedata['line_orientation'] == 'horizontal' and line_position is not None:
                     # Horizontal line: compare Y positions
-                    line_center = (line_y1 + line_y2) / 2 if line_y2 else line_y1
-                    if target_y < line_center - POSITION_MARGIN:
+                    if target_y < line_position - POSITION_MARGIN:
                         linedata['calculated_side'] = 'Detected above line'
-                    elif target_y > line_center + POSITION_MARGIN:
+                    elif target_y > line_position + POSITION_MARGIN:
                         linedata['calculated_side'] = 'Detected below line'
                     else:
                         linedata['calculated_side'] = 'At detection line'
@@ -615,115 +604,112 @@ def process_linedetection(linedata):
     update_openhab_item(ITEM_LC_DETECTION_TARGET, detection_target)
     update_openhab_item(ITEM_LC_OBJECT_TYPE, object_type)
     
-    # Calculate direction from position history
+    # Calculate direction - prioritize regionID mapping over position-based detection
+    # METHOD 1 (Preferred): Use camera's configured line crossing rules (regionID → direction)
+    # METHOD 2 (Fallback): Calculate from object position after crossing
+    region_id = linedata.get('region_id', '0')
     target_x = linedata.get('target_x', '')
     target_y = linedata.get('target_y', '')
     line_orientation = linedata.get('line_orientation', 'unknown')
     tracking_axis = linedata.get('tracking_axis', 'X')
+    line_position = linedata.get('line_position')  # Normalized line position (can be None)
     direction_text = 'Direction Not Available'
     
-    logger.info(f"🔍 Starting direction calculation - Line:{line_orientation}, Axis:{tracking_axis}, X={target_x}, Y={target_y}, History:{len(detection_history)}")
+    logger.info(f"🔍 Line crossing detected - RegionID:{region_id}, Line:{line_orientation} at {line_position}, Axis:{tracking_axis}, X={target_x}, Y={target_y}")
     
     try:
-        current_x = float(target_x) if target_x else None
-        current_y = float(target_y) if target_y else None
-        current_time = datetime.now()
-        
-        # Determine which coordinate to track based on line orientation
-        if tracking_axis == 'X' and current_x is not None:
-            current_pos = current_x
-            axis_name = 'X'
-        elif tracking_axis == 'Y' and current_y is not None:
-            current_pos = current_y
-            axis_name = 'Y'
-        else:
-            current_pos = None
-            axis_name = None
-        
-        if current_pos is not None:
-            logger.info(f"🔍 Current {axis_name}={current_pos:.3f}, checking history...")
-            # Calculate direction by comparing with recent detections
-            if len(detection_history) >= 1:
-                # Get recent positions within configured time window
-                recent_positions = [d for d in detection_history 
-                                  if (current_time - d['timestamp']).total_seconds() < HISTORY_TIME_WINDOW]
-                
-                logger.info(f"🔍 Found {len(recent_positions)} recent positions within {HISTORY_TIME_WINDOW}s window")
-                
-                if recent_positions:
-                    # Compare current position to average of recent positions
-                    if tracking_axis == 'X':
-                        avg_recent = sum(d['x'] for d in recent_positions) / len(recent_positions)
-                    else:  # Y axis
-                        avg_recent = sum(d['y'] for d in recent_positions) / len(recent_positions)
-                    
-                    pos_diff = current_pos - avg_recent
-                    
-                    logger.info(f"🔍 Avg Recent {axis_name}={avg_recent:.3f}, Current {axis_name}={current_pos:.3f}, Diff={pos_diff:.3f}")
-                    
-                    # Determine direction based on movement
-                    if abs(pos_diff) > MOVEMENT_THRESHOLD:  # Significant movement threshold
-                        # For vertical lines: 
-                        #   B side = LEFT (small X), A side = RIGHT (large X)
-                        #   A→B = RIGHT to LEFT = X decreasing = ENTER
-                        #   B→A = LEFT to RIGHT = X increasing = EXIT
-                        # For horizontal lines:
-                        #   A side = TOP (small Y), B side = BOTTOM (large Y)
-                        #   A→B = TOP to BOTTOM = Y increasing = ENTER
-                        #   B→A = BOTTOM to TOP = Y decreasing = EXIT
-                        
-                        if tracking_axis == 'X':
-                            # Vertical line: X decreasing = A→B = ENTER
-                            is_enter = pos_diff < 0
-                        else:
-                            # Horizontal line: Y increasing = A→B = ENTER
-                            is_enter = pos_diff > 0
-                        
-                        if is_enter:
-                            # A→B = ENTER
-                            if 'vehicle' in detection_target.lower():
-                                direction_text = 'Vehicle Enter'
-                            elif 'human' in detection_target.lower():
-                                direction_text = 'Human Enter'
-                            else:
-                                direction_text = 'Object Enter'
-                        else:
-                            # B→A = EXIT
-                            if 'vehicle' in detection_target.lower():
-                                direction_text = 'Vehicle Exit'
-                            elif 'human' in detection_target.lower():
-                                direction_text = 'Human Exit'
-                            else:
-                                direction_text = 'Object Exit'
-                        
-                        logger.info(f"📍 Direction calculated: {axis_name}={current_pos:.3f}, Avg={avg_recent:.3f}, Diff={pos_diff:.3f} → {direction_text}")
-                    else:
-                        # Movement too small, show position
-                        calculated_side = linedata.get('calculated_side', '')
-                        direction_text = calculated_side if calculated_side else 'Minimal movement'
-                        logger.info(f"🔍 Movement too small ({pos_diff:.3f} < {MOVEMENT_THRESHOLD}), showing position: {direction_text}")
-                else:
-                    # First detection after long gap, show position
-                    calculated_side = linedata.get('calculated_side', '')
-                    direction_text = calculated_side if calculated_side else 'No recent history'
-                    logger.info(f"🔍 No recent positions in window, showing position: {direction_text}")
-            else:
-                # Not enough history yet, show position
-                calculated_side = linedata.get('calculated_side', '')
-                direction_text = calculated_side if calculated_side else 'Initializing...'
-                logger.info(f"🔍 Not enough history ({len(detection_history)}), showing: {direction_text}")
+        # METHOD 1: Check if regionID maps to a configured direction (most reliable)
+        if region_id in REGION_DIRECTION_MAP:
+            configured_direction = REGION_DIRECTION_MAP[region_id].lower()
+            is_enter = (configured_direction == 'enter')
             
-            # Add current detection to history (store both X and Y for flexibility)
-            detection_history.append({
-                'timestamp': current_time,
-                'x': current_x if current_x is not None else 0.0,
-                'y': current_y if current_y is not None else 0.0,
-                'target': detection_target
-            })
+            # Apply direction inversion if configured
+            if INVERT_DIRECTION:
+                is_enter = not is_enter
+                logger.info(f"🔄 Direction inverted by config")
+            
+            if is_enter:
+                if 'vehicle' in detection_target.lower():
+                    direction_text = 'Vehicle Enter'
+                elif 'human' in detection_target.lower():
+                    direction_text = 'Human Enter'
+                else:
+                    direction_text = 'Object Enter'
+            else:
+                if 'vehicle' in detection_target.lower():
+                    direction_text = 'Vehicle Exit'
+                elif 'human' in detection_target.lower():
+                    direction_text = 'Human Exit'
+                else:
+                    direction_text = 'Object Exit'
+            
+            logger.info(f"✅ DIRECTION from regionID {region_id}: {direction_text} (configured as '{configured_direction}')")
+        
+        # METHOD 2: Fall back to position-based detection if no region mapping
         else:
-            # No valid position coordinate
-            logger.warning(f"🔍 No valid position coordinate for tracking (axis={tracking_axis}, X={current_x}, Y={current_y})")
-            direction_text = 'Direction Not Available'
+            if region_id != '0':
+                logger.warning(f"⚠️  RegionID {region_id} not in region_direction_mapping config - falling back to position-based detection")
+            
+            current_x = float(target_x) if target_x else None
+            current_y = float(target_y) if target_y else None
+            
+            # Determine which coordinate to track based on line orientation
+            if tracking_axis == 'X' and current_x is not None:
+                current_pos = current_x
+                axis_name = 'X'
+            elif tracking_axis == 'Y' and current_y is not None:
+                current_pos = current_y
+                axis_name = 'Y'
+            else:
+                current_pos = None
+                axis_name = None
+            
+            if current_pos is not None and line_position is not None:
+                # Determine which side of the line the object is on AFTER crossing
+                # For horizontal line (tracking Y): A=top (small Y), B=bottom (large Y)
+                # For vertical line (tracking X): A=right (large X), B=left (small X)
+                
+                if tracking_axis == 'Y':
+                    # Horizontal line: compare Y position to line position
+                    current_side = 'A' if current_pos < line_position else 'B'
+                    side_description = 'above' if current_side == 'A' else 'below'
+                else:
+                    # Vertical line: compare X position to line position  
+                    current_side = 'A' if current_pos > line_position else 'B'
+                    side_description = 'right' if current_side == 'A' else 'left'
+                
+                logger.info(f"📍 Object is on side {current_side} ({side_description} line) | {axis_name}={current_pos:.3f}, Line={line_position:.3f}")
+                
+                # Since camera only alerts when crossing happens, determine direction from final position
+                # If on side B after crossing → came from A → ENTER
+                # If on side A after crossing → came from B → EXIT
+                is_enter = (current_side == 'B')
+                
+                # Apply direction inversion if configured
+                if INVERT_DIRECTION:
+                    is_enter = not is_enter
+                    logger.info(f"🔄 Direction inverted by config")
+                
+                if is_enter:
+                    if 'vehicle' in detection_target.lower():
+                        direction_text = 'Vehicle Enter'
+                    elif 'human' in detection_target.lower():
+                        direction_text = 'Human Enter'
+                    else:
+                        direction_text = 'Object Enter'
+                else:
+                    if 'vehicle' in detection_target.lower():
+                        direction_text = 'Vehicle Exit'
+                    elif 'human' in detection_target.lower():
+                        direction_text = 'Human Exit'
+                    else:
+                        direction_text = 'Object Exit'
+                
+                logger.info(f"✅ DIRECTION (position-based): {direction_text} | Object crossed to side {current_side} ({side_description})")
+            else:
+                # No valid position coordinate or line position
+                logger.warning(f"🔍 No valid position coordinate for tracking (axis={tracking_axis}, X={current_x}, Y={current_y}, Line={line_position})")
+                direction_text = 'Direction Not Available'
     except Exception as e:
         logger.error(f"Error calculating direction: {e}", exc_info=True)
         direction_text = 'Direction Error'
@@ -775,6 +761,7 @@ def save_linedetection_image(jpeg_data, timestamp_str):
         with tempfile.NamedTemporaryFile(mode='wb', dir=HTML_OUTPUT_PATH, delete=False) as tmp:
             tmp.write(jpeg_data)
             temp_path = tmp.name
+        os.chmod(temp_path, 0o664)  # Set permissions: rw-rw-r-- for web server access
         os.rename(temp_path, image_path)
         logger.info(f"✅ Saved line crossing image: {image_path} ({len(jpeg_data)} bytes)")
         
@@ -783,6 +770,7 @@ def save_linedetection_image(jpeg_data, timestamp_str):
         with tempfile.NamedTemporaryFile(mode='wb', dir=HTML_OUTPUT_PATH, delete=False) as tmp:
             tmp.write(jpeg_data)
             temp_path = tmp.name
+        os.chmod(temp_path, 0o664)  # Set permissions: rw-rw-r-- for web server access
         os.rename(temp_path, latest_path)
         
         # Save timestamp for HTML viewer (atomically)
@@ -790,6 +778,7 @@ def save_linedetection_image(jpeg_data, timestamp_str):
         with tempfile.NamedTemporaryFile(mode='w', dir=HTML_OUTPUT_PATH, delete=False) as tmp:
             tmp.write(time_string)
             temp_path = tmp.name
+        os.chmod(temp_path, 0o664)  # Set permissions: rw-rw-r-- for web server access
         os.rename(temp_path, timestamp_path)
         
         # Update OpenHAB item with filename
@@ -1044,8 +1033,9 @@ if __name__ == '__main__':
     logger.info(f"Camera 2 (Line Crossing): {CAMERA_LINE.get('name', 'Unknown')} - {CAMERA_LINE.get('ip', 'Unknown')}")
     logger.info("-" * 70)
     logger.info(f"Detection Settings:")
-    logger.info(f"  Movement threshold: {MOVEMENT_THRESHOLD*100:.1f}% | Position margin: {POSITION_MARGIN*100:.1f}%")
-    logger.info(f"  History: {HISTORY_BUFFER_SIZE} detections | Time window: {HISTORY_TIME_WINDOW}s")
+    logger.info(f"  Direction detection: Region-based (using camera rule IDs)")
+    logger.info(f"  Region mapping: {dict(REGION_DIRECTION_MAP)}")
+    logger.info(f"  Position margin: {POSITION_MARGIN*100:.1f}% | Invert direction: {INVERT_DIRECTION}")
     logger.info("=" * 70)
     
     app.run(host='0.0.0.0', port=WEBHOOK_PORT, debug=False)
