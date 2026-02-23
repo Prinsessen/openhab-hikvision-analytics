@@ -81,6 +81,7 @@ ITEM_FACE_EXPRESSION = body_items.get('face_expression', 'Hikvision_FaceExpressi
 ITEM_MOTION_DIRECTION = body_items.get('motion_direction', 'Hikvision_MotionDirection')
 ITEM_FACE_SCORE = body_items.get('face_score', 'Hikvision_FaceScore')
 ITEM_HUMAN_SCORE = body_items.get('human_score', 'Hikvision_HumanScore')
+ITEM_IMAGE_FILENAME = body_items.get('image_filename', 'Hikvision_ImageFilename')
 
 # Line crossing item names
 ITEM_LC_EVENT_TYPE = line_items.get('event_type', 'LineCrossing_EventType')
@@ -187,16 +188,74 @@ def extract_analytics_from_webhook_bytes(content_text, content_bytes):
                 except json.JSONDecodeError as e:
                     logger.error(f"Failed to parse extracted JSON: {e}")
                     return None, None
+            
+            # Analytics extraction (OUTSIDE the try/except block - runs for both success and fallback)
+            analytics = {}
+            
+            # Extract camera/event info from top level
+            analytics['channelName'] = result.get('channelName', 'unknown')
+            analytics['eventType'] = result.get('eventType', 'unknown')
+            
+            # Try NEW FORMAT first: PersonArmingTrackInfo → PersonInfo
+            person_arming_info = result.get('PersonArmingTrackInfo', {})
+            person_info = person_arming_info.get('PersonInfo', {})
+            
+            if person_info:
+                logger.debug("Detected PersonArmingTrack format (new Camera 1 format)")
+                logger.debug(f"PersonInfo keys: {list(person_info.keys())}")
                 
-                analytics = {}
+                # Extract Face analytics from FaceCaptureResult
+                face_info = person_info.get('Face', {})
+                face_capture = face_info.get('FaceCaptureResult', {})
                 
-                # Extract camera/event info from top level
-                analytics['channelName'] = result.get('channelName', 'unknown')
-                analytics['eventType'] = result.get('eventType', 'unknown')
+                logger.debug(f"Has Face: {bool(face_info)}, Has FaceCaptureResult: {bool(face_capture)}")
                 
-                # Extract Face and Human analytics from CaptureResult[0]
+                if face_capture:
+                    # Extract ALL face analytics fields dynamically
+                    for key, value in face_capture.items():
+                        # Skip image data and position rectangles
+                        if key in ['FaceImage', 'FaceBackgroundImage', 'Rect', 'FacePictureRect']:
+                            continue
+                        
+                        # Handle nested dict values (most fields have {value: x})
+                        if isinstance(value, dict):
+                            if 'value' in value:
+                                analytics[f'face_{key}'] = str(value['value'])
+                            # Also extract ageGroup if present
+                            if key == 'age' and 'ageGroup' in value:
+                                analytics['face_ageGroup'] = value['ageGroup']
+                        else:
+                            analytics[f'face_{key}'] = str(value)
+                    
+                    # Use dateTime from top level as snapTime
+                    analytics['face_snapTime'] = result.get('dateTime', '')
+                
+                # Extract Human analytics from HumanCaptureResult
+                human_info = person_info.get('Human', {})
+                human_capture = human_info.get('HumanCaptureResult', {})
+                
+                if human_capture:
+                    # Extract ALL human analytics fields dynamically
+                    for key, value in human_capture.items():
+                        # Skip image data and position rectangles
+                        if key in ['HumanImage', 'HumanBackgroundImage', 'Rect']:
+                            continue
+                        
+                        # Handle nested dict values (most fields have {value: x})
+                        if isinstance(value, dict):
+                            if 'value' in value:
+                                analytics[f'human_{key}'] = str(value['value'])
+                        else:
+                            analytics[f'human_{key}'] = str(value)
+                    
+                    # Use dateTime from top level as snapTime
+                    analytics['human_snapTime'] = result.get('dateTime', '')
+            
+            else:
+                # FALLBACK: OLD FORMAT - Extract Face and Human analytics from CaptureResult[0]
                 capture_results = result.get('CaptureResult', [])
                 if capture_results and len(capture_results) > 0:
+                    logger.debug("Detected CaptureResult format (old format)")
                     capture = capture_results[0]
                     
                     # Extract Face analytics
@@ -212,14 +271,18 @@ def extract_analytics_from_webhook_bytes(content_text, content_bytes):
                         for prop in human.get('Property', []):
                             analytics['human_' + prop['description']] = prop['value']
                         analytics['human_snapTime'] = human.get('snapTime', '')
-                
-                logger.debug(f"Parsed JSON successfully, found {len(analytics)} analytics keys")
-                
-                # Extract image from webhook bytes (tries high-res, falls back to cropped)
-                background_image = extract_image_with_fallback(content_bytes)
-                
-                if len(analytics) > 2:  # More than just channel/event
-                    return analytics, background_image
+            
+            logger.debug(f"Parsed JSON successfully, found {len(analytics)} analytics keys")
+            logger.debug(f"Analytics keys: {list(analytics.keys())}")
+            
+            # Extract image from webhook bytes (tries high-res, falls back to cropped)
+            background_image = extract_image_with_fallback(content_bytes)
+            
+            if len(analytics) > 2:  # More than just channel/event
+                logger.debug(f"Returning {len(analytics)} analytics fields")
+                return analytics, background_image
+            else:
+                logger.debug(f"Only {len(analytics)} analytics fields (need > 2), skipping")
         
         logger.warning("Could not find valid JSON in webhook content")
         return None, None
@@ -350,7 +413,14 @@ def save_detection_image(jpeg_data, timestamp_str):
             tmp.write(jpeg_data)
             temp_path = tmp.name
         os.rename(temp_path, image_path)
+        os.chmod(image_path, 0o644)  # Make readable by web server
         logger.info(f"✅ Saved detection image: {image_path} ({len(jpeg_data)} bytes)")
+        
+        # Update OpenHAB item with filename
+        update_openhab_item(ITEM_IMAGE_FILENAME, IMAGE_FILENAME)
+        
+        # Note: Removed redundant OpenHAB Image item upload (was causing 1-3 second delay)
+        # HTML viewer loads images directly from disk, so upload is not needed
         
         # Save timestamp atomically (just time part for HTML display)
         time_only = timestamp_str.split()[1] if ' ' in timestamp_str else timestamp_str
@@ -359,6 +429,7 @@ def save_detection_image(jpeg_data, timestamp_str):
             tmp.write(time_only)
             temp_path = tmp.name
         os.rename(temp_path, timestamp_path)
+        os.chmod(timestamp_path, 0o644)  # Make readable by web server
         logger.debug(f"Saved timestamp: {timestamp_path}")
         
     except Exception as e:

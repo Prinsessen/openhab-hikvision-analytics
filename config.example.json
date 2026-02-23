@@ -81,10 +81,17 @@
       "has_bag": "Hikvision_HasBag",
       "has_things": "Hikvision_HasThings",
       "has_mask": "Hikvision_HasMask",
+      "ride": "Hikvision_Ride",
       "gender": "Hikvision_Gender",
+      "age": "Hikvision_Age",
       "age_group": "Hikvision_AgeGroup",
       "hair_style": "Hikvision_HairStyle",
-      "motion_direction": "Hikvision_MotionDirection"
+      "face_expression": "Hikvision_FaceExpression",
+      "motion_direction": "Hikvision_MotionDirection",
+      "face_score": "Hikvision_FaceScore",
+      "human_score": "Hikvision_HumanScore",
+      "image_filename": "Hikvision_ImageFilename",
+      "image_snapshot": "Hikvision_ImageSnapshot"
     },
     "line_crossing": {
       "event_type": "LineCrossing_EventType",
